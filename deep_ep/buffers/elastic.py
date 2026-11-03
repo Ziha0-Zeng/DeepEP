@@ -399,7 +399,7 @@ class ElasticBuffer:
         if (
             type(capacity) is not int
             or not b <= capacity <= 256
-            or runtime.world_size not in (16, 32, 64, 128, 256)
+            or runtime.world_size not in (8, 16, 32, 64, 128, 256)
             or topk_weights is None
         ):
             return None
@@ -571,6 +571,8 @@ class ElasticBuffer:
         previous_event_before_epilogue,
         async_with_compute_stream,
         allocate_on_comm_stream,
+        benchmark_device_barrier=False,
+        benchmark_gate=None,
     ):
         import torch
         from ..utils.event import EventHandle, EventOverlap
@@ -635,14 +637,19 @@ class ElasticBuffer:
                 attach(self, tensors, "combine")
                 from ..utils.ll_reference_profile import attach as attach_reference
                 attach_reference(self, tensors, "combine")
-                retained = tuple(value for key, value in tensors.items() if key != "ll_stage_timer_mode")
+                from ..utils.ll_combine_profile import attach as attach_combine
+                attach_combine(self, tensors)
+                retained = tuple(value for key, value in tensors.items()
+                                 if key not in ("ll_stage_timer_mode", "ll_combine_profile_level"))
                 for value in retained:
                     if not isinstance(value, torch.Tensor):
                         raise ValueError("LL handle is missing a required tensor")
                     value.record_stream(runtime.stream)
                 runtime.notify_inflight = retained
                 try:
-                    native.combine_low_latency(runtime.native, tensors, b, h, k, e, dtype, runtime.stream.npu_stream)
+                    elapsed_us = native.combine_low_latency(
+                        runtime.native, tensors, b, h, k, e, dtype, runtime.stream.npu_stream,
+                        benchmark_device_barrier, benchmark_gate)
                     event = EventOverlap(EventHandle(), retained)
                 except Exception:
                     runtime.notify_failed = True
@@ -651,7 +658,26 @@ class ElasticBuffer:
                     raise
             event.current_stream_wait()
             runtime.notify_inflight = None
+            if benchmark_device_barrier:
+                return tensors["output"], None, event, float(elapsed_us)
             return tensors["output"], None, event
+
+    def _benchmark_combine_low_latency(self, x, handle, gate=None):
+        """Benchmark-only kernel timing after a stream-ordered device collective."""
+        return self._combine_low_latency(
+            x,
+            handle,
+            None,
+            None,
+            0,
+            0,
+            None,
+            None,
+            False,
+            False,
+            True,
+            gate,
+        )
 
     def dispatch(
         self,

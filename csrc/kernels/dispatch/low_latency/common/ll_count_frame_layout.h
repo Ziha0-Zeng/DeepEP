@@ -18,10 +18,11 @@ inline
 #endif
 LlCountFrame CountFrame(uint32_t experts, uint32_t world, uint32_t countCores,
                         uint32_t destination, uint32_t source, uint32_t localExpert,
-                        bool directRanks = false)
+                        bool directRanks = false,
+                        uint32_t ranksPerHost = kLlPhysicalRanksPerHost)
 {
     const uint32_t local = experts / world, expert = destination * local + localExpert;
-    if (directRanks && !LlSameHost(destination, source)) {
+    if (directRanks && !LlSameHost(destination, source, ranksPerHost)) {
         // One source/core owns all experts of this remote rank. The compact
         // body and its trailing 32B commit travel in the same SO WQE.
         const uint64_t frame = uint64_t(source) * local * 512U;

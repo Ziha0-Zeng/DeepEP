@@ -97,7 +97,7 @@ inline int BuildDispatchServerDedupLayout(int64_t rankSize, int64_t bs, int64_t 
         uint32_t(moeExpertNum), countCores, uint32_t(rankSize), false);
 #ifdef DEEPEP_LL_RDMA
     // The same binary also supports the MTE selector; admit both source budgets.
-    if (rankSize > kLlPhysicalRanksPerHost)
+    if (rankSize >= 8)
         countUb = std::max(countUb, DispatchServerDedupCountSendUbBytes(uint64_t(bs) * topK,
             uint32_t(moeExpertNum), countCores, uint32_t(rankSize), true));
 #endif

@@ -75,7 +75,7 @@ public:
         if (!bytes || bytes % 512U || bytes > LlRdma::kCoreBytes) { Trap(); return; }
         const uint32_t slots = LlRdma::kCoreBytes / bytes_;
         capacity_ = slots; // use every complete packet slot in the 128KiB GM stage
-        if (uint32_t(args_->rankSize) > DispatchDedup::kLlPhysicalRanksPerHost)
+        if (uint32_t(args_->rankSize) > RanksPerHost(args_))
             stageBase_ = Stage(args_, capacity_ * bytes_);
     }
     __aicore__ inline bool Pending() const { return count_ != 0U; }

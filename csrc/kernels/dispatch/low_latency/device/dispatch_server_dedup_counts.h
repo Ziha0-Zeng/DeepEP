@@ -49,8 +49,11 @@ public:
         rscvStatusNum_ = experts;
         moeExpertNumPerRank_ = experts / epWorldSize_;
         expertTokenNumsType_ = expertTokenNumsType;
+        ranksPerHost_ = LlTransport::RanksPerHost(args_);
         packedFrames_ = LlTransport::Rdma(args_) && epWorldSize_ > 16U;
-        directRanks_ = LlTransport::Rdma(args_) && epWorldSize_ > kLlPhysicalRanksPerHost;
+        // Direct rank frames require the matching packed-frame receiver.
+        // EP8/16 retain strided records for both local MTE and remote RoCE.
+        directRanks_ = packedFrames_ && epWorldSize_ > ranksPerHost_;
         countWindow_ = DispatchServerDedupWindowOffset(magic);
         retirement_.Init(args_);
         layout_ = DispatchServerDedupCountLayout(experts, GetBlockNum());
@@ -158,6 +161,7 @@ private:
     uint32_t activeCumSumCores_ = 0;
     bool packedFrames_ = false;
     bool directRanks_ = false;
+    uint32_t ranksPerHost_ = kLlPhysicalRanksPerHost;
     uint64_t countWindow_ = 0U;
     LlTransport::CountRetirement retirement_;
     GM_ADDR recvCntWorkspaceGM_ = nullptr;
@@ -183,7 +187,7 @@ __aicore__ inline void ServerDedupCounts::SendCnt()
     // Each local target keeps a separate UB source until its writes retire.
     const uint32_t cores = coreNum_;
     const auto assignment = CountAssignment(epRankId_, epWorldSize_, rscvStatusNum_,
-                                            coreNum_, aivId_, directRanks_);
+                                            coreNum_, aivId_, directRanks_, ranksPerHost_);
     const bool remoteOwner = assignment.remoteRank < epWorldSize_;
     // Local target records stay reserved through metadata. MTE3_S retires the remote
     // UB frame copy; its isolated GM source survives independently until CQ retirement.
@@ -211,13 +215,13 @@ __aicore__ inline void ServerDedupCounts::SendCnt()
     SyncFunc<HardEvent::MTE2_V>();
     if (remoteOwner) {
         auto remoteFrame = workBuf_.Get<int32_t>();
-        for (uint32_t task = aivId_; task < epWorldSize_ - kLlPhysicalRanksPerHost; task += coreNum_) {
-            const uint32_t destination = CountRemotePeer(epRankId_, epWorldSize_, task);
+        for (uint32_t task = aivId_; task < epWorldSize_ - ranksPerHost_; task += coreNum_) {
+            const uint32_t destination = CountRemotePeer(epRankId_, epWorldSize_, task, ranksPerHost_);
             const uint32_t first = destination * moeExpertNumPerRank_;
             CountRemoteRank(first, remoteFrame, assignment.remoteRecords);
             SyncFunc<HardEvent::S_MTE3>();
             const auto frame = CountFrame(rscvStatusNum_, epWorldSize_, cores,
-                                          destination, epRankId_, 0U, true);
+                                          destination, epRankId_, 0U, true, ranksPerHost_);
             LlTransport::DirectCountFrame(args_, destination, stateOffset_ + frame.frameOffset,
                 remoteFrame.ReinterpretCast<uint8_t>(), moeExpertNumPerRank_, dstExpBuf_.Get<uint8_t>(), countWindow_);
             retirement_.Posted(destination);
@@ -233,7 +237,7 @@ __aicore__ inline void ServerDedupCounts::SendCnt()
 
     uint32_t localIndex = 0U;
     for (uint32_t task = aivId_; task < assignment.localDomain; task += coreNum_, ++localIndex) {
-        const uint32_t destination = CountLocalPeer(epRankId_, task, directRanks_);
+        const uint32_t destination = CountLocalPeer(epRankId_, task, directRanks_, ranksPerHost_);
         const uint32_t start = destination * moeExpertNumPerRank_, end = start + moeExpertNumPerRank_;
         statusTensor_ = statusBuf_.Get<int32_t>()[localIndex * statusCntAlign_ * UB_ALIGN_DATA_COUNT];
         if (expertIdsCnt_ >= SIZE_ALIGN_256 / sizeof(int32_t) && 2U * maskBytes <= routeBytes)
@@ -336,7 +340,7 @@ __aicore__ inline void ServerDedupCounts::SendExpertCntRange(uint32_t start, uin
         const uint64_t offset = (uint64_t(localExpert) * epWorldSize_ + epRankId_) * kEpServerDedupCountGmStride;
         if (packedFrames_) {
             const auto frame = CountFrame(rscvStatusNum_, epWorldSize_,
-                coreNum_, dst, epRankId_, localExpert, directRanks_);
+                coreNum_, dst, epRankId_, localExpert, directRanks_, ranksPerHost_);
             // Keep the existing receive layout's fragment boundaries even when
             // the target rank is now owned by one metadata core in its entirety.
             LlTransport::CountFrame(args_, dst, stateOffset_ + frame.frameOffset, stateOffset_ + frame.commitOffset,
@@ -481,7 +485,7 @@ __aicore__ inline void ServerDedupCounts::WaitDispatchClearStatus()
         for (uint32_t logical = startStatusIndex_; logical < endStatusIndex_; ++logical) {
             const uint32_t expert = logical / epWorldSize_, source = logical % epWorldSize_;
             const auto frame = CountFrame(rscvStatusNum_, epWorldSize_,
-                coreNum_, epRankId_, source, expert, directRanks_);
+                coreNum_, epRankId_, source, expert, directRanks_, ranksPerHost_);
             // Retire body ready words too: a later shape/partition may place a
             // commit at a former dense-record boundary. Counts are snapshotted.
             DataCopy(selfRankWinInGMTensor_[frame.recordOffset / sizeof(float)], zero, 8U);
@@ -628,7 +632,7 @@ __aicore__ inline void ServerDedupCounts::WaitDispatch()
     LlCountReadPlan readPlan;
     if (packedFrames_ && !BuildCountReadPlan(rscvStatusNum_, epWorldSize_,
             coreNum_, epRankId_,
-            startStatusIndex_, recStatusNumPerCore_, readPlan, directRanks_)) { Trap(); return; }
+            startStatusIndex_, recStatusNumPerCore_, readPlan, directRanks_, ranksPerHost_)) { Trap(); return; }
 
     DataCopyParams intriParams{static_cast<uint16_t>(recStatusNumPerCore_), 1,
                                static_cast<uint16_t>(CNT_GM_STRIDE_BLOCKS - 1U), 0};

@@ -64,6 +64,7 @@ COMBINE_DEDUP_EP_COMBINE_CONSTEXPR bool EpCombineEarlyReduce(uint32_t bs)
 #ifdef DEEPEP_LL_COMBINE_EARLY_REDUCE
     return bs <= 72U;
 #else
+    (void)bs;
     return false;
 #endif
 }

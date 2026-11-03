@@ -1,6 +1,7 @@
 // Copyright (c) 2026, Lu Lu
 
 #include "ops/low_latency.hpp"
+#include <acl/acl.h>
 #include <pybind11/stl.h>
 #include <climits>
 #include <stdexcept>
@@ -16,9 +17,11 @@
 #include "host/mem/shmem_host_heap.h"
 #include "host/data_plane/shmem_host_rma.h"
 #include "host/data_plane/shmem_host_p2p_sync.h"
+#include "host/data_plane/shmem_host_cc.h"
 #include "../kernels/dispatch/low_latency/common/ep_memory_server_dedup_layout.h"
 #include "../kernels/dispatch/low_latency/common/ep_memory_server_dedup_tiling.h"
 #include "../kernels/combine/low_latency/combine_layout.h"
+#include "../kernels/combine/low_latency/combine_profile_layout.h"
 #include "../kernels/combine/low_latency/ep_memory_server_dedup_combine_tiling.h"
 #include "../kernels/dispatch/low_latency/launch.hpp"
 #include "../kernels/combine/low_latency/launch.hpp"
@@ -28,6 +31,95 @@ namespace deepep {
 namespace {
 using Shape = std::vector<int64_t>;
 constexpr uint64_t kRankBaseBiasBytes = 1024U;
+
+void check_acl(int status, const char* operation)
+{
+    if (status != 0) {
+        throw std::runtime_error(std::string(operation) + " failed: " + std::to_string(status));
+    }
+}
+
+class TimelineInterval {
+    aclrtEvent start_ = nullptr;
+    aclrtEvent end_ = nullptr;
+
+public:
+    TimelineInterval()
+    {
+        check_acl(aclrtCreateEventWithFlag(&start_, ACL_EVENT_TIME_LINE), "create start Event");
+        try {
+            check_acl(aclrtCreateEventWithFlag(&end_, ACL_EVENT_TIME_LINE), "create end Event");
+        } catch (...) {
+            aclrtDestroyEvent(start_);
+            start_ = nullptr;
+            throw;
+        }
+    }
+    ~TimelineInterval()
+    {
+        if (end_) aclrtDestroyEvent(end_);
+        if (start_) aclrtDestroyEvent(start_);
+    }
+    void begin(aclrtStream stream)
+    {
+        check_acl(aclrtRecordEvent(start_, stream), "record start Event");
+    }
+    void end(aclrtStream stream)
+    {
+        check_acl(aclrtRecordEvent(end_, stream), "record end Event");
+    }
+    float finish_us(aclrtStream stream)
+    {
+        check_acl(aclrtSynchronizeStream(stream), "synchronize benchmark stream");
+        float ms = 0.0F;
+        check_acl(aclrtEventElapsedTime(&ms, start_, end_), "read benchmark Event");
+        return ms * 1000.0F;
+    }
+};
+
+// Benchmark-only local submission gate, using the CANN Notify API rather than
+// an AICore spin kernel. HCCL supplies the cross-rank synchronization.
+class BenchmarkLaunchGate {
+    aclrtNotify notify_ = nullptr;
+    aclrtStream control_ = nullptr;
+    aclrtStream target_ = nullptr;
+    bool armed_ = false;
+    bool released_ = false;
+public:
+    BenchmarkLaunchGate()
+    {
+        check_acl(aclrtCreateNotify(&notify_, 0), "create benchmark launch notify");
+        try {
+            check_acl(aclrtCreateStream(&control_), "create benchmark release stream");
+        } catch (...) {
+            aclrtDestroyNotify(notify_);
+            throw;
+        }
+    }
+    ~BenchmarkLaunchGate()
+    {
+        // Also unblock a partially submitted stream if a gate callback throws.
+        if (armed_ && !released_) aclrtRecordNotify(notify_, control_);
+        if (armed_) aclrtSynchronizeStream(target_);
+        if (control_) {
+            aclrtSynchronizeStream(control_);
+            aclrtDestroyStream(control_);
+        }
+        if (notify_) aclrtDestroyNotify(notify_);
+    }
+    void arm(aclrtStream stream)
+    {
+        target_ = stream;
+        check_acl(aclrtWaitAndResetNotify(notify_, stream, 120000), "arm benchmark launch notify");
+        armed_ = true;
+    }
+    void release()
+    {
+        check_acl(aclrtRecordNotify(notify_, control_), "release benchmark launch notify");
+        released_ = true;
+    }
+};
+
 uint32_t pin_session_cores(Session& session)
 {
     session.workspace();
@@ -39,7 +131,8 @@ uint32_t pin_session_cores(Session& session)
 uint8_t* peer_buffer_base(Session& session, int peer)
 {
     if (peer < 0 || peer >= session.world()) throw std::invalid_argument("Invalid LL peer");
-    if (session.ll_rdma() && !DispatchDedup::LlSameHost(session.rank(), peer)) return nullptr;
+    if (session.ll_rdma() && !DispatchDedup::LlSameHost(
+            session.rank(), peer, session.ll_ranks_per_host())) return nullptr;
     auto* original = static_cast<uint8_t*>(peer == session.rank() ? session.workspace() : aclshmem_ptr(session.workspace(), peer));
     if (original == nullptr) throw std::invalid_argument("Invalid LL peer mapping");
     if (session.capacity() != (8ULL << 30)) return original;
@@ -63,6 +156,24 @@ uint8_t* tensor(py::handle value, const Shape& shape, const char* dtype)
 uint8_t* stage_timer(py::dict tensors, uint32_t cores, uint32_t& mode, bool allow_reference = false)
 {
     mode = 1U;
+    if (tensors.contains("ll_combine_profile")) {
+        if (allow_reference || !deepep_ll_combine_profile_enabled())
+            throw std::invalid_argument("Combine profiling requires a Combine call and DEEPEP_LL_COMBINE_PROFILE=ON");
+        for (const auto* key : {"ll_stage_timer", "ll_reference_profile", "ll_expert_timer"})
+            if (tensors.contains(key) && !tensors[key].is_none())
+                throw std::invalid_argument("Combine profiling cannot be mixed with other tracing");
+        mode = tensors["ll_combine_profile_level"].cast<uint32_t>();
+        if (mode != 1U && mode != 2U) throw std::invalid_argument("Invalid Combine profile level");
+        auto profile = py::reinterpret_borrow<py::object>(tensors["ll_combine_profile"]);
+        auto device = profile.attr("device");
+        if (device.attr("type").cast<std::string>() != "npu" ||
+            !device.attr("__eq__")(tensors["input"].attr("device")).cast<bool>())
+            throw std::invalid_argument("Combine profile must be on the input NPU");
+        auto* pointer = tensor(profile, {cores, CombineProfile::kWords}, "int64");
+        if (reinterpret_cast<uintptr_t>(pointer) % 512U != 0U)
+            throw std::invalid_argument("Combine profile requires 512-byte alignment");
+        return pointer;
+    }
     if (tensors.contains("ll_reference_profile") && !tensors["ll_reference_profile"].is_none()) {
         if (!allow_reference) throw std::invalid_argument("LL reference profiling supports dispatch only");
         if ((tensors.contains("ll_stage_timer") && !tensors["ll_stage_timer"].is_none()) ||
@@ -171,6 +282,38 @@ void bind_low_latency(py::module_& module)
     module.attr("low_latency_roce_qps_per_peer") = 0; // actual active physical cores
     module.attr("low_latency_implementation") = "ndr-hns1825";
     module.attr("low_latency_combine_small_batch") = bool(deepep_ll_combine_small_batch_enabled());
+    module.attr("low_latency_combine_profile_enabled") = bool(deepep_ll_combine_profile_enabled());
+    module.def("low_latency_combine_profile_layout", []() {
+        py::dict result;
+        result["schema"] = CombineProfile::kSchema;
+        result["words"] = CombineProfile::kWords;
+        result["count"] = uint32_t(CombineProfile::Count);
+        py::dict indices;
+#define PROFILE_WORD(name) indices[#name] = uint32_t(CombineProfile::name)
+        PROFILE_WORD(Entry); PROFILE_WORD(ProfileInitEnd); PROFILE_WORD(MagicEnd);
+        PROFILE_WORD(InitCountEnd); PROFILE_WORD(InitLayoutEnd); PROFILE_WORD(InitEnd);
+        PROFILE_WORD(StageBegin); PROFILE_WORD(StageSelected); PROFILE_WORD(StageCopiesEnd);
+        PROFILE_WORD(StageDrained); PROFILE_WORD(StageEnd);
+        PROFILE_WORD(NotifyBegin); PROFILE_WORD(NotifyLocalReady); PROFILE_WORD(NotifyEnd);
+        PROFILE_WORD(ReadyBegin); PROFILE_WORD(ReadyEnd);
+        PROFILE_WORD(PartialBegin); PROFILE_WORD(PartialInitEnd); PROFILE_WORD(PlanBegin);
+        PROFILE_WORD(PlanEnd); PROFILE_WORD(PartialRunBegin); PROFILE_WORD(PartialRunEnd); PROFILE_WORD(PartialEnd);
+        PROFILE_WORD(FinalBegin); PROFILE_WORD(FinalInitEnd); PROFILE_WORD(FinalFirstReady);
+        PROFILE_WORD(FinalLastReady); PROFILE_WORD(FinalLastStore); PROFILE_WORD(FinalEnd); PROFILE_WORD(DrainEnd);
+        PROFILE_WORD(DirectBegin); PROFILE_WORD(DirectPrepared); PROFILE_WORD(DirectFirstSubmit);
+        PROFILE_WORD(DirectLastSubmit); PROFILE_WORD(DirectEnd); PROFILE_WORD(PipeDone); PROFILE_WORD(FlushDone);
+        PROFILE_WORD(StageRows); PROFILE_WORD(DirectRows); PROFILE_WORD(PartialRows); PROFILE_WORD(FinalTokens);
+        PROFILE_WORD(PartialScanTicks); PROFILE_WORD(PartialMetadataTicks); PROFILE_WORD(PartialGetWaitTicks);
+        PROFILE_WORD(PartialComputeIssueTicks); PROFILE_WORD(PartialSubmitTicks);
+        PROFILE_WORD(ProbeTicks); PROFILE_WORD(ProbeMissTicks); PROFILE_WORD(ProbeCalls); PROFILE_WORD(ProbeMisses);
+        PROFILE_WORD(FinalComputeIssueTicks); PROFILE_WORD(RdmaPutTicks); PROFILE_WORD(RdmaQuietTicks);
+        PROFILE_WORD(RdmaPackets); PROFILE_WORD(RdmaQuietCalls); PROFILE_WORD(Contributions);
+        PROFILE_WORD(Rank); PROFILE_WORD(Core); PROFILE_WORD(Tokens); PROFILE_WORD(World);
+        PROFILE_WORD(Schema); PROFILE_WORD(Complete); PROFILE_WORD(Valid); PROFILE_WORD(Level);
+#undef PROFILE_WORD
+        result["indices"] = indices;
+        return result;
+    });
     module.attr("low_latency_combine_recv_cores") = deepep_ll_combine_recv_cores();
     module.attr("low_latency_combine_early_reduce") = bool(deepep_ll_combine_early_reduce_enabled());
     module.attr("low_latency_combine_return_options") = deepep_ll_combine_return_options();
@@ -237,7 +380,7 @@ void bind_low_latency(py::module_& module)
         result["dispatch_recv_cores"] = DispatchDedup::MetadataSplitValid(cfg.active) ? DispatchDedup::PayloadCores(cfg.active) : 0U;
         return result;
     });
-    for (uint32_t world : {16U, 32U, 64U, 128U, 256U})
+    for (uint32_t world : {8U, 16U, 32U, 64U, 128U, 256U})
         if (deepep_ll_ranks_per_group(world) != DispatchDedup::LlGroupForWorld(world))
             throw std::runtime_error("LL Host/device tiling-key policy mismatch; rebuild the complete wheel");
     module.def("low_latency_ranks_per_group", [](uint32_t world) { return DispatchDedup::LlGroupForWorld(world); });
@@ -258,7 +401,7 @@ void bind_low_latency(py::module_& module)
         if (session.combine_only()) throw std::invalid_argument("LL requires a dense-channel Session");
         if (session.capacity() != DispatchDedup::kEpServerDedupPeerBytes ||
             session.world() > DispatchDedup::DISPATCH_DEDUP_MAX_RANK_SIZE ||
-            session.world() < 16 || session.world() % DispatchDedup::LlGroupForWorld(session.world()) != 0) {
+            session.world() < 8 || session.world() % DispatchDedup::LlGroupForWorld(session.world()) != 0) {
             throw std::invalid_argument("LL requires exactly 8 GiB of symmetric workspace");
         }
         pin_session_cores(session);
@@ -267,7 +410,7 @@ void bind_low_latency(py::module_& module)
         args.rankSize = session.world();
         args.localRank = session.rank() % DispatchDedup::LlGroupForWorld(session.world());
         args.localRankSize = DispatchDedup::LlGroupForWorld(session.world());
-        args.reserved0 = DispatchDedup::kLlPhysicalRanksPerHost;
+        args.reserved0 = session.ll_ranks_per_host();
         args.peerMemBytes = session.capacity();
         args.fftsVal = shmemx_get_ffts_config();
         if (session.ll_rdma()) {
@@ -278,7 +421,8 @@ void bind_low_latency(py::module_& module)
         }
         for (int peer = 0; peer < session.world(); ++peer) {
             args.peerMems[peer] = peer_buffer_base(session, peer);
-            if (session.ll_rdma() && !DispatchDedup::LlSameHost(session.rank(), peer)) continue;
+            if (session.ll_rdma() && !DispatchDedup::LlSameHost(
+                    session.rank(), peer, session.ll_ranks_per_host())) continue;
             if (args.peerMems[peer] == nullptr || reinterpret_cast<uintptr_t>(args.peerMems[peer]) % 32) {
                 throw std::invalid_argument("LL requires aligned MTE mappings for every peer");
             }
@@ -381,7 +525,9 @@ void bind_low_latency(py::module_& module)
         if (status != 0) throw std::runtime_error("NDR combine result initialization failed: " + std::to_string(status));
     });
     module.def("combine_low_latency", [](Session& session, py::dict tensors, int b, int h, int k, int e,
-                                         const std::string& dtype, uintptr_t stream_address) {
+                                         const std::string& dtype, uintptr_t stream_address,
+                                         bool benchmark_device_barrier,
+                                         py::object benchmark_gate) -> py::object {
         if (session.combine_only()) throw std::invalid_argument("LL requires a dense-channel Session");
         CombineDedup::Layout plan{};
         if (!stream_address || session.capacity() != DispatchDedup::kEpServerDedupPeerBytes ||
@@ -411,9 +557,37 @@ void bind_low_latency(py::module_& module)
         args.yOut = get("output", {b, h}, dtype.c_str());
         args.tilingData = get("tiling", {sizeof(CombineDedup::EpServerDedupCombineTilingData)}, "uint8");
         session.workspace();
-        py::gil_scoped_release release;
+        float elapsed_us = 0.0F;
         session.invalidate_dispatch_controls();
-        combine_server_dedup_kernel_do(reinterpret_cast<void*>(stream_address), &args);
+        auto stream = reinterpret_cast<aclrtStream>(stream_address);
+        if (benchmark_device_barrier) {
+            TimelineInterval timer;
+            BenchmarkLaunchGate launch_gate;
+            launch_gate.arm(stream);
+            // Invoke the public HCCL gate only AFTER all Python tensor validation.
+            // Its Work.wait() adds a dependency to the current runtime stream.
+            // Host coordination, gate submission and completion are outside Events.
+            if (!benchmark_gate.is_none()) {
+                benchmark_gate();
+            } else {
+                if (session.ll_rdma() && session.world() > int(session.ll_ranks_per_host()))
+                    throw std::invalid_argument("Cross-host timing requires an HCCL device gate");
+                check_acl(aclshmemx_barrier_on_stream(ACLSHMEM_TEAM_WORLD, stream),
+                          "enqueue benchmark device barrier");
+            }
+            py::gil_scoped_release release;
+            timer.begin(stream);
+            combine_server_dedup_kernel_do(stream, &args);
+            timer.end(stream);
+            // Everything is queued before any local task can execute. Each rank
+            // releases its own Notify, then HCCL absorbs inter-rank release skew.
+            launch_gate.release();
+            elapsed_us = timer.finish_us(stream);
+        } else {
+            py::gil_scoped_release release;
+            combine_server_dedup_kernel_do(stream, &args);
+        }
+        return benchmark_device_barrier ? py::cast(elapsed_us) : py::none();
     });
 }
 }  // namespace deepep

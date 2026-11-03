@@ -73,6 +73,17 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     const std::string backend = backend_env ? backend_env : "mte";
     if (backend != "mte" && backend != "rdma") throw std::invalid_argument("DEEPEP_LL_BACKEND must be mte or rdma");
     ll_rdma_ = backend == "rdma";
+    if (ll_rdma_) {
+        const char* ranks_env = std::getenv("DEEPEP_LL_RANKS_PER_HOST");
+        char* end = nullptr;
+        const unsigned long value = ranks_env ? std::strtoul(ranks_env, &end, 10) : 16UL;
+        if ((ranks_env && (end == ranks_env || *end != '\0')) || value == 0 || value > 16 ||
+            (value & (value - 1)) || size % int(value) != 0) {
+            throw std::invalid_argument(
+                "DEEPEP_LL_RANKS_PER_HOST must be a power of two in [1, 16] that divides world size");
+        }
+        ll_ranks_per_host_ = static_cast<uint32_t>(value);
+    }
     if (ll_rdma_ && (udma || megamoe || combine_only || use_1g_huge_pages))
         throw std::invalid_argument("RDMA LL requires a plain LL Session; mixed HT/UDMA runtimes are unsupported");
 #ifndef DEEPEP_LL_RDMA
@@ -126,10 +137,10 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     if (ll_rdma_) {
         if (bytes != (8ULL << 30)) throw std::invalid_argument("RDMA LL requires the 8 GiB workspace");
         ll_rdma_qps_ = query_ll_core_config().active;
-        validate_ll_rdma_qps(ll_rdma_qps_, size > int(DispatchDedup::kLlPhysicalRanksPerHost));
+        validate_ll_rdma_qps(ll_rdma_qps_, size > int(ll_ranks_per_host_));
         low_latency_cores_ = ll_rdma_qps_;
         const uint64_t used_staging = uint64_t(ll_rdma_qps_) * LlRdma::kCoreBytes;
-        if (size > int(DispatchDedup::kLlPhysicalRanksPerHost))
+        if (size > int(ll_ranks_per_host_))
             staging_bytes = (used_staging + alignment - 1U) / alignment * alignment;
     }
 #endif
@@ -144,7 +155,7 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     attr.option_attr.data_op_engine_type =
         udma ? static_cast<data_op_engine_type_t>(ACLSHMEM_DATA_OP_MTE | ACLSHMEM_DATA_OP_UDMA) : ACLSHMEM_DATA_OP_MTE;
 #ifdef DEEPEP_LL_RDMA
-    if (ll_rdma_) attr.option_attr.data_op_engine_type = size > int(DispatchDedup::kLlPhysicalRanksPerHost)
+    if (ll_rdma_) attr.option_attr.data_op_engine_type = size > int(ll_ranks_per_host_)
         ? static_cast<data_op_engine_type_t>(ACLSHMEM_DATA_OP_MTE | ACLSHMEM_DATA_OP_ROCE) : ACLSHMEM_DATA_OP_MTE;
 #endif
     attr.option_attr.shm_init_timeout = timeout;
@@ -160,7 +171,7 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     bool runtime_started = false;
     try {
 #ifdef DEEPEP_LL_RDMA
-        if (ll_rdma_ && size > int(DispatchDedup::kLlPhysicalRanksPerHost)) check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_ROCE, ll_rdma_qps_), "ROCE QP configuration");
+        if (ll_rdma_ && size > int(ll_ranks_per_host_)) check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_ROCE, ll_rdma_qps_), "ROCE QP configuration");
 #endif
         if (udma) {
             // Combine owns pairs 0..15; peer-table Dispatch uses pairs 0..7.

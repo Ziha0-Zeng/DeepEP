@@ -13,9 +13,11 @@ template<HardEvent E> __aicore__ inline void Sync(uint32_t id) {
     WaitFlag<E>(id);
 }
 __aicore__ inline bool Rdma(const __gm__ Args* a) { return a->reservedConfig[0] == LlRdma::kBackend; }
+__aicore__ inline uint32_t RanksPerHost(const __gm__ Args* a) {
+    return a->reserved0 ? a->reserved0 : DispatchDedup::kLlPhysicalRanksPerHost;
+}
 __aicore__ inline bool SameHost(const __gm__ Args* a, uint32_t peer) {
-    return DispatchDedup::LlSameHost(uint32_t(a->rank), peer,
-        a->reserved0 ? a->reserved0 : DispatchDedup::kLlPhysicalRanksPerHost);
+    return DispatchDedup::LlSameHost(uint32_t(a->rank), peer, RanksPerHost(a));
 }
 __aicore__ inline bool RemoteWrite(const __gm__ Args* a, uint32_t peer) { return Rdma(a) && !SameHost(a, peer); }
 __aicore__ inline void Check(const __gm__ Args* a, uint32_t peer, uint64_t offset, uint64_t bytes) {

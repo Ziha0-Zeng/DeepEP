@@ -129,6 +129,19 @@ class Runtime:
             rank, size = group.rank(), group.size()
         else:
             rank, size = rank_and_world(group, rank, world_size)
+        try:
+            self.ll_ranks_per_host = int(os.environ.get("DEEPEP_LL_RANKS_PER_HOST", "16"))
+        except ValueError as exc:
+            raise ValueError("DEEPEP_LL_RANKS_PER_HOST must be an integer") from exc
+        if self.ll_backend == "rdma" and (
+            self.ll_ranks_per_host < 1
+            or self.ll_ranks_per_host > 16
+            or self.ll_ranks_per_host & (self.ll_ranks_per_host - 1)
+            or size % self.ll_ranks_per_host
+        ):
+            raise ValueError(
+                "DEEPEP_LL_RANKS_PER_HOST must be a power of two in [1, 16] that divides world size"
+            )
         factory = native.Runtime
         if self._megamoe:
             integer("world_size", size, 2, 128)
@@ -152,8 +165,8 @@ class Runtime:
         self.group = group
         self.host_coordinated = self.ll_backend == "rdma"
         self.coordination_failed = False
-        if self.host_coordinated and (group is None or store_group or backend != "hccl"):
-            raise ValueError("NDR requires the existing HCCL ProcessGroup for Host coordination")
+        if self.host_coordinated and (group is None or store_group):
+            raise ValueError("NDR requires an existing Gloo or HCCL ProcessGroup for Host coordination")
         self.low_latency_comm_args = None
         self.closed = False
         with _LOCK:
@@ -177,6 +190,7 @@ class Runtime:
                             self.device,
                         ]
                     )
+                local_values.append(self.ll_ranks_per_host)
                 local_values.append(
                     int(udma)
                     + 2 * int(combine_only)
@@ -207,6 +221,8 @@ class Runtime:
                     raise ValueError(
                         "Ranks disagree on MTE/URMA/RDMA runtime engines, QP configuration, page size or debug_collectives"
                     )
+                if any(value[-2] != values[0][-2] for value in values):
+                    raise ValueError("Ranks disagree on DEEPEP_LL_RANKS_PER_HOST")
                 if self._megamoe:
                     invalid_hosts = [i for i, value in enumerate(values) if value[4] == 0]
                     if invalid_hosts:
@@ -234,7 +250,7 @@ class Runtime:
                         "ASCEND_RT_VISIBLE_DEVICES", "ASCEND_VISIBLE_DEVICES",
                         "CUDA_VISIBLE_DEVICES", "PROBE_VISIBLE_DEVICES"))
                     dist.all_gather_object(topology, (_host_boot_id(), mapping, self.device), group=group)
-                    validate_ndr_topology(topology)
+                    validate_ndr_topology(topology, self.ll_ranks_per_host)
             self.rank, self.world_size = rank, size
             self.capacity = capacity
             self.notify_lock = threading.RLock()
@@ -260,7 +276,7 @@ class Runtime:
             )
             _OWNER = self
             self.coordination_failed = False
-            if capacity == 8 << 30 and 16 <= size <= 256:
+            if capacity == 8 << 30 and 8 <= size <= 256:
                 # LL peers must finish initialization before any payload writes.
                 if self.host_coordinated:
                     self._host_collective("barrier")
@@ -346,9 +362,9 @@ class Runtime:
         self.combine_window_layout = layout
 
 
-def validate_ndr_topology(topology):
-    if not topology or len(topology) % 16:
-        raise ValueError("NDR requires 16 contiguous ranks per physical host")
+def validate_ndr_topology(topology, ranks_per_host=16):
+    if not topology or len(topology) % ranks_per_host:
+        raise ValueError(f"NDR requires {ranks_per_host} contiguous ranks per physical host")
     hosts = {}
     devices = set()
     mappings = {}
@@ -362,9 +378,12 @@ def validate_ndr_topology(topology):
         if (host, device) in devices:
             raise ValueError("NDR ranks must use distinct local devices")
         devices.add((host, device))
-    expected = [list(range(start, start + 16)) for start in range(0, len(topology), 16)]
+    expected = [
+        list(range(start, start + ranks_per_host))
+        for start in range(0, len(topology), ranks_per_host)
+    ]
     if sorted(hosts.values()) != expected:
-        raise ValueError("NDR requires 16 contiguous ranks per physical host")
+        raise ValueError(f"NDR requires {ranks_per_host} contiguous ranks per physical host")
 
 
 def runtime_of(buffer):

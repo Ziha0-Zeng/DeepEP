@@ -277,6 +277,7 @@ def build_configuration(environment=None):
 
     result["ll_stage_timer"] = enabled("DEEPEP_LL_STAGE_TIMER", env)
     result["ll_reference_profile"] = enabled("DEEPEP_LL_REFERENCE_PROFILE", env)
+    result["ll_combine_profile"] = enabled("DEEPEP_LL_COMBINE_PROFILE", env)
     result["ll_combine_remote_first"] = enabled("DEEPEP_LL_COMBINE_REMOTE_FIRST", env)
     result["ll_combine_defer_return"] = enabled("DEEPEP_LL_COMBINE_DEFER_RETURN", env)
     result["ll_combine_small_batch"] = enabled("DEEPEP_LL_COMBINE_SMALL_BATCH", env)
@@ -494,6 +495,7 @@ class CMakeBuild(build_ext):
             f"-DDEEPEP_DEVICE_JOBS={jobs}",
             f"-DDEEPEP_LL_STAGE_TIMER={'ON' if configuration.get('ll_stage_timer', False) else 'OFF'}",
             f"-DDEEPEP_LL_REFERENCE_PROFILE={'ON' if configuration.get('ll_reference_profile', False) else 'OFF'}",
+            f"-DDEEPEP_LL_COMBINE_PROFILE={'ON' if configuration.get('ll_combine_profile', False) else 'OFF'}",
             f"-DDEEPEP_LL_COMBINE_REMOTE_FIRST={'ON' if configuration.get('ll_combine_remote_first', False) else 'OFF'}",
             f"-DDEEPEP_LL_COMBINE_DEFER_RETURN={'ON' if configuration.get('ll_combine_defer_return', False) else 'OFF'}",
             f"-DDEEPEP_LL_COMBINE_SMALL_BATCH={'ON' if configuration.get('ll_combine_small_batch', False) else 'OFF'}",

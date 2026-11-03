@@ -22,7 +22,8 @@ inline
 #endif
 bool BuildCountReadPlan(uint32_t experts, uint32_t world, uint32_t countCores,
                        uint32_t destination, uint32_t first, uint32_t count, LlCountReadPlan& out,
-                       bool directRanks = false)
+                       bool directRanks = false,
+                       uint32_t ranksPerHost = kLlPhysicalRanksPerHost)
 {
     out.size = 0;
     if (world < 32U || world > 256U || experts < world || experts > 1024U || experts % world ||
@@ -34,9 +35,10 @@ bool BuildCountReadPlan(uint32_t experts, uint32_t world, uint32_t countCores,
         const uint32_t logical = first + consumed;
         const uint32_t source = logical % world;
         const uint32_t available = directRanks
-            ? kLlPhysicalRanksPerHost - source % kLlPhysicalRanksPerHost : world - source;
+            ? ranksPerHost - source % ranksPerHost : world - source;
         const uint32_t length = count - consumed < available ? count - consumed : available;
-        const auto frame = CountFrame(experts, world, countCores, destination, source, logical / world, directRanks);
+        const auto frame = CountFrame(
+            experts, world, countCores, destination, source, logical / world, directRanks, ranksPerHost);
         out.runs[out.size++] = {frame.recordOffset, frame.commitOffset, consumed, length};
         consumed += length;
     }

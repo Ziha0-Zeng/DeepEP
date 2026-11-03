@@ -28,7 +28,7 @@ def test_launch_identities():
 @pytest.mark.parametrize(
     "world,argv",
     [
-        (8, []),
+        (4, []),
         (16, ["--num-max-tokens-per-rank", "257"]),
         (16, ["--num-tokens", "32", "--num-max-tokens-per-rank", "16"]),
         (16, ["--num-sms", "64"]),
@@ -47,6 +47,7 @@ def test_ll_capacity_boundary_and_defaults():
     assert st.validate_args(args, 16) == 255
     assert not args.skip_check and not args.skip_perf_test and args.repeat_combine >= 2
     assert st.validate_args(st.make_parser().parse_args([]), 16) == 16
+    assert st.validate_args(st.make_parser().parse_args([]), 8) == 16
 
 
 def test_unique_routes_and_expanded_counts():

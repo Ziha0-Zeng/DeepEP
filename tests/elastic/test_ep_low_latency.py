@@ -157,13 +157,26 @@ def make_parser():
     parser.add_argument("--plan", action="store_true", help="Print the case matrix without importing Torch")
     parser.add_argument("--output-dir", default="benchmark-runs", help="Parent for a unique run directory and traces")
     parser.add_argument("--run-name", help="Optional fixed child directory name; existing directory is rejected")
-    parser.add_argument('--backend',choices=('mte','rdma'),help='Optional override; default is determined by the installed kernel branch')
+    parser.add_argument('--backend', choices=('mte', 'rdma'), default='mte',
+                        help='LL transport; MTE is the default and matches ll_cpp_bench')
     parser.add_argument(
         "--perf-tail",
         type=int,
         default=50,
         help="Statistics use last N samples; default: min(50, num_iters); 0 uses all",
     )
+    parser.add_argument(
+        "--perf-timer",
+        choices=("device-barrier", "event", "profiler"),
+        default="device-barrier",
+        help=("Latency source: native gated kernel Event (default; HCCL for RDMA, "
+              "SHMEM for MTE), full Python API Event, or intrusive "
+              "torch_npu profiler kernel tasks (diagnostic only)"),
+    )
+    parser.add_argument("--verify-device-timer", action="store_true",
+                        help="Diagnostic: compare native Events against CANN kernel tasks")
+    parser.add_argument("--benchmark-gate-delay-ms", type=float, default=0,
+                        help="Diagnostic: delay rank 0 before each device gate, outside timing")
     parser.add_argument("--num-processes", type=int, default=8, help="Local spawned processes, as in DeepEP")
     parser.add_argument("--num-nodes", type=int, default=1)
     parser.add_argument("--node-rank", type=int, default=0)
@@ -233,6 +246,8 @@ def make_parser():
                         help="Require the corresponding compiled Combine variant; does not change the installed kernel")
     parser.add_argument("--combine-recv-cores", type=int,
                         help="Check compiled Combine receive-core setting (0=half); rebuild to change it")
+    parser.add_argument("--combine-profile-level", type=int, choices=(0, 1, 2), default=0,
+                        help="Diagnostic last-call AIV timeline: 1=stages, 2=detail counters; requires profile build")
     parser.add_argument("--combine-early-reduce", type=int, choices=(0, 1),
                         help="Check compiled early-reduction switch; rebuild to change it")
     parser.add_argument("--repeat-combine", type=int, default=2)
@@ -316,6 +331,11 @@ def summarize_kernel(samples_by_rank, kernel, tail):
         ranks.append({"rank": rank, **sample_stats(selected), "kernel_us": raw})
     # Pool individual kernel durations after selecting each rank's stable tail.
     pooled = sample_stats(selected_samples)
+    # Keep samples aligned by iteration as well as by rank. This is the
+    # aggregation used by ll_cpp_bench: each iteration is represented by the
+    # slowest rank, rather than mixing all ranks into one distribution.
+    aligned = [raw[-tail:] if tail else raw for raw in samples_by_rank]
+    rank_max = sample_stats([max(values) for values in zip(*aligned)])
     fastest = min(ranks, key=lambda row: row["mean_us"])
     slowest = max(ranks, key=lambda row: row["mean_us"])
     return {
@@ -331,6 +351,9 @@ def summarize_kernel(samples_by_rank, kernel, tail):
         "max_rank_mean_kernel_us": slowest["mean_us"],
         "fastest_rank": fastest["rank"],
         "slowest_rank": slowest["rank"],
+        "rank_max_samples": rank_max["samples"],
+        **{f"rank_max_{name}_kernel_us": rank_max[f"{name}_us"]
+           for name in ("mean", "p99", "p90", "p50")},
     }
 
 
@@ -363,6 +386,7 @@ def write_reports(directory, report):
                     "combine_variant": "optimized" if (identity.get("combine_small_batch") or
                         identity.get("combine_recv_cores", 0) or identity.get("combine_early_reduce")) else "baseline",
                     "combine_recv_cores": identity.get("combine_recv_cores", 0),
+                    "measurement": perf.get("measurement"),
                     "combine_early_reduce": identity.get("combine_early_reduce", False),
                     **{key:identity.get(key) for key in ('implementation','transport','logical_group','active_aiv','core_protocol','source_revision')}}
             summaries.append(
@@ -510,8 +534,8 @@ def validate_args(args, world):
         return max(capacities)
     if args.num_bytes != 8 << 30:
         raise ValueError("LL ST requires --num-bytes 8589934592 (exactly 8 GiB)")
-    if world not in (16, 32, 64, 128, 256):
-        raise ValueError("LL ST requires EP16/32/64/128/256; EP8 would exercise HT, not LL")
+    if world not in (8, 16, 32, 64, 128, 256):
+        raise ValueError("LL ST requires EP8/16/32/64/128/256")
     m = args.num_tokens if args.num_max_tokens_per_rank is None else args.num_max_tokens_per_rank
     if not 0 < args.num_tokens <= m <= 256:
         raise ValueError("LL ST requires 0 < actual B <= M <= 256")
@@ -533,8 +557,19 @@ def validate_args(args, world):
             raise ValueError('Reference profiling requires --dispatch-only')
         if args.ll_timer_mode != 'observe':
             raise ValueError('Reference profiling has fixed scalar boundaries; drain is unsupported')
+    if getattr(args, 'combine_profile_level', 0):
+        if args.perf_timer != 'device-barrier' or args.skip_check or args.skip_perf_test or args.dispatch_only:
+            raise ValueError('Combine profile requires device-barrier timing, performance calls and correctness checks')
+        if diagnostic_requested(args):
+            raise ValueError('Combine profile cannot be mixed with dispatch/stage diagnostics')
     if diagnostic_requested(args) and args.skip_check:
         raise ValueError("Stage diagnostics require correctness checks")
+    if not math.isfinite(args.benchmark_gate_delay_ms) or args.benchmark_gate_delay_ms < 0:
+        raise ValueError("benchmark-gate-delay-ms must be finite and nonnegative")
+    if (args.verify_device_timer or args.benchmark_gate_delay_ms) and args.perf_timer != "device-barrier":
+        raise ValueError("Timer validation requires --perf-timer device-barrier")
+    if args.benchmark_gate_delay_ms and args.backend != "rdma":
+        raise ValueError("Gate-delay validation currently requires --backend rdma")
     if args.warmup < 0 or args.num_iters < 1 or args.repeat_combine < 2:
         raise ValueError("Require warmup>=0, num-iters>=1 and repeat-combine>=2")
     if not 1 <= args.num_cpu_timeout_secs <= 300:
@@ -910,6 +945,166 @@ def measure(invoke, args, operation, profile_dir, progress=None, after_profile=N
     return summarize_kernel(gathered, kernel, args.perf_tail)
 
 
+def measure_event(invoke, args, operation, profile_dir, progress=None, after_profile=None):
+    """Measure one complete Python LL operation per device Event interval.
+
+    The CANN profiler reports named device tasks, whereas this Event interval
+    reports completion of the full Python API operation. Event timing is the
+    full-operation path. Test-side coordination is outside the interval, but the
+    runtime's internal Host coordination and stream waits are included; this is not the narrower
+    direct-kernel interval reported by ll_cpp_bench.
+    """
+    import torch
+    import torch.distributed as dist
+
+    kernel = f"{operation}_server_dedup_kernel"
+    if progress:
+        progress(f"{operation}.warmup")
+    completion_boundary(args)
+    for _ in range(args.warmup):
+        output = invoke()
+    torch.npu.synchronize()
+
+    samples = []
+    for _ in range(args.num_iters):
+        # This is intentionally outside start/end. It prevents one rank from
+        # entering the collective with an older outstanding kernel while not
+        # charging host rendezvous to the device kernel.
+        completion_boundary(args)
+        start = torch.npu.Event(enable_timing=True)
+        end = torch.npu.Event(enable_timing=True)
+        start.record()
+        output = invoke()
+        end.record()
+        torch.npu.synchronize()
+        elapsed_us = start.elapsed_time(end) * 1000.0
+        if not math.isfinite(elapsed_us) or elapsed_us <= 0:
+            raise ValueError(f"Invalid device Event duration for {kernel}: {elapsed_us}")
+        samples.append(elapsed_us)
+
+    if after_profile is not None:
+        after_profile()
+    del output
+    if progress:
+        progress(f"{operation}.write_event_samples")
+    Path(profile_dir).mkdir(parents=True, exist_ok=True)
+    (Path(profile_dir) / "samples.json").write_text(
+        json.dumps({"measurement": "device_event_us", "kernel": kernel,
+                    "kernel_us": samples}) + "\n"
+    )
+    gathered = [None] * dist.get_world_size()
+    trace_call(args, f"{operation}.samples.all_gather", dist.all_gather_object, gathered, samples)
+    result = summarize_kernel(gathered, kernel, args.perf_tail)
+    result["measurement"] = "device_event_us"
+    return result
+
+
+class HcclBenchmarkGate:
+    """Public all_reduce + Work.wait: device completion dependency, not CPU barrier.
+
+    Construct collectively outside measurement. The callback is invoked by native
+    code after tensor validation, while the runtime communication stream is current.
+    Keep the token alive until all benchmark work is complete.
+    """
+    def __init__(self, device, timeout_seconds, delay_ms=0):
+        import torch
+        import torch.distributed as dist
+        from datetime import timedelta
+        self.group = (dist.group.WORLD if dist.get_backend() == "hccl" else
+                      dist.new_group(backend="hccl", timeout=timedelta(seconds=timeout_seconds)))
+        self.token = torch.ones(1, dtype=torch.float32, device=device)
+        # Delay injection targets steady-state submissions, not communicator setup.
+        self.delay_ms = 0
+        self.__call__()
+        torch.npu.synchronize()
+        self.delay_ms = delay_ms
+
+    def __call__(self):
+        import torch.distributed as dist
+        # MAX keeps the reusable token bounded, with no fill operation in the loop.
+        if self.delay_ms and dist.get_rank() == 0:
+            import time
+            time.sleep(self.delay_ms / 1000.0)
+        work = dist.all_reduce(self.token, op=dist.ReduceOp.MAX,
+                               group=self.group, async_op=True)
+        work.wait()
+        # Native launch uses ACL directly. NPUStream.stream() (npu_stream getter)
+        # drains torch_npu's Host submission queue without synchronizing the device,
+        # so the HCCL completion wait is actually enqueued before native Events.
+        import torch
+        _ = torch.npu.current_stream().npu_stream
+
+
+def measure_device_barrier(invoke, args, operation, profile_dir, progress=None, after_profile=None,
+                           check_output=None):
+    """Measure the raw Combine kernel after an on-stream all-rank device barrier."""
+    import torch
+    import torch.distributed as dist
+
+    if operation != "combine":
+        raise ValueError("Device-barrier timing is only available for combine")
+    kernel = "combine_server_dedup_kernel"
+    if progress:
+        progress("combine.device_barrier_warmup")
+    completion_boundary(args)
+    for _ in range(args.warmup):
+        output = invoke()
+    torch.npu.synchronize()
+
+    samples = []
+    profiler = None
+    validation_dir = Path(profile_dir) / "timer_validation"
+    if args.verify_device_timer:
+        import torch_npu
+        validation_dir.mkdir(parents=True, exist_ok=True)
+        profiler = torch_npu.profiler.profile(
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(str(validation_dir)),
+            experimental_config=torch_npu.profiler._ExperimentalConfig(
+                profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+                export_type=torch_npu.profiler.ExportType.Text))
+        profiler.start()
+    try:
+        for _ in range(args.num_iters):
+            output = invoke()
+            elapsed_us = float(output[3])
+            if not math.isfinite(elapsed_us) or elapsed_us <= 0:
+                raise ValueError(f"Invalid native device Event duration for {kernel}: {elapsed_us}")
+            samples.append(elapsed_us)
+    finally:
+        if profiler is not None:
+            profiler.stop()
+    if profiler is not None:
+        def validate_profile():
+            device_samples = kernel_durations(validation_dir, kernel, args.num_iters)
+            (validation_dir / "comparison.json").write_text(json.dumps({
+                "event_us": samples, "profiler_kernel_us": device_samples,
+                "mean_event_us": statistics.mean(samples),
+                "mean_profiler_kernel_us": statistics.mean(device_samples),
+                "note": "Diagnostic run includes profiler overhead; not the performance result"
+            }, indent=2) + "\n")
+        agree_check(validate_profile, args, dist.get_rank())
+    if check_output is not None:
+        agree_check(lambda: check_output(output), args, dist.get_rank())
+
+    if after_profile is not None:
+        after_profile()
+    del output
+    if progress:
+        progress("combine.write_device_barrier_samples")
+    Path(profile_dir).mkdir(parents=True, exist_ok=True)
+    (Path(profile_dir) / "samples.json").write_text(
+        json.dumps({"measurement": "device_barrier_kernel_us", "kernel": kernel,
+                    "kernel_us": samples}) + "\n"
+    )
+    gathered = [None] * dist.get_world_size()
+    trace_call(args, "combine.samples.all_gather", dist.all_gather_object, gathered, samples)
+    result = summarize_kernel(gathered, kernel, args.perf_tail)
+    result["measurement"] = ("device_barrier_kernel_us_profiled" if args.verify_device_timer
+                             else "device_barrier_kernel_us")
+    result["timed_output_correctness"] = "passed" if check_output is not None else "skipped"
+    return result
+
+
 def create_run_directory(parent, name=None):
     parent = Path(parent).absolute()
     if name is not None and (not name or name in ('.', '..') or '/' in name or '\\' in name):
@@ -1024,6 +1219,13 @@ def sample_operation(buffer, invoke, check, args, operation, rank, m, mode, prog
             diagnostic()
         return None
     profile = Path(args.run_directory) / f'case_{args.case_id:05d}' / mode / operation / f'rank_{rank:03d}'
+    if args.perf_timer == "device-barrier" and operation == "combine":
+        return measure_device_barrier(invoke, args, operation, profile, progress,
+                                      after_profile=diagnostic if diagnostic_requested(args) else None,
+                                      check_output=None if args.skip_check else check)
+    if args.perf_timer in ("device-barrier", "event"):
+        return measure_event(invoke, args, operation, profile, progress,
+                             after_profile=diagnostic if diagnostic_requested(args) else None)
     return measure(invoke, args, operation, profile, progress,
                    after_profile=diagnostic if diagnostic_requested(args) else None)
 
@@ -1204,9 +1406,30 @@ def run_case(buffer, args, rank, world, m, mode):
         trace_call(args, "dispatch.event.wait", event.current_stream_wait)
         trace_call(args, "device.synchronize", torch.npu.synchronize)
         expert_output = prepare_experts(recv, counts, rank, args.num_experts, world, expert_dtype)
-        perf = sample_operation(buffer,
-            lambda: buffer.combine(expert_output, handle, topk_weights=None),
-            check_timed_combine, args, 'combine', rank, m, mode, progress)
+        if args.perf_timer == "device-barrier":
+            gate = None
+            if args.backend == "rdma":
+                gate = getattr(buffer, "_ll_benchmark_gate", None)
+                if gate is None:
+                    gate = HcclBenchmarkGate(expert_output.device, args.num_cpu_timeout_secs, args.benchmark_gate_delay_ms)
+                    buffer._ll_benchmark_gate = gate
+            combine_invoke = lambda: buffer._benchmark_combine_low_latency(expert_output, handle, gate)
+        else:
+            combine_invoke = lambda: buffer.combine(expert_output, handle, topk_weights=None)
+        if getattr(args, 'combine_profile_level', 0):
+            from deep_ep.utils.ll_combine_profile import CombineTrace, capture
+            trace = CombineTrace(buffer, args.combine_profile_level, args.ll_timer_frequency_hz)
+            with capture(trace):
+                perf = sample_operation(
+                    buffer, combine_invoke, check_timed_combine, args, 'combine', rank, m, mode, progress)
+            directory = (Path(args.run_directory) / f'case_{args.case_id:05d}' / mode /
+                         'combine_profile' / f'rank_{rank:03d}')
+            agree_check(lambda: trace.save(directory, rank, world, args.num_tokens), args, rank)
+            if perf is not None:
+                perf['measurement'] = 'device_barrier_kernel_us_instrumented'
+        else:
+            perf = sample_operation(
+                buffer, combine_invoke, check_timed_combine, args, 'combine', rank, m, mode, progress)
         if perf is not None:
             result['combine'] = perf
     if rank == 0:
@@ -1250,10 +1473,13 @@ def worker(local_rank, args):
         # Agree before creating a SHMEM Session or launching an instrumented kernel.
         core_config = native.low_latency_core_config()
         implementation=getattr(native,'low_latency_implementation','unknown')
-        backend=args.backend or ('rdma' if implementation=='ndr-hns1825' else 'mte')
-        # One CLI choice drives Python and native initialization; stale shell state
-        # does not change the selected branch's default in this experiment entry.
+        backend=args.backend
+        # One CLI choice drives Python and native initialization; stale shell
+        # state does not change the benchmark backend. MTE needs dense UDMA
+        # channels with the pinned SHMEM SDK used by ll_cpp_bench.
         os.environ['DEEPEP_LL_BACKEND']=backend
+        if backend == 'mte':
+            os.environ.setdefault('DEEPEP_SHMEM_DENSE_QPS', '1')
         if args.trace_ops:
             os.environ['DEEPEP_LL_INIT_TRACE'] = '1'
         capability = {"active_aiv": core_config["active_aiv"],
@@ -1393,8 +1619,18 @@ def worker(local_rank, args):
                 "result_count": len(results),
                 "config": vars(args),
                 "package": deep_ep.__file__,
-                "measurement": "torch_npu profiler kernel tasks; per-rank statistics and slowest rank mean",
-                "alignment": "separate dispatch/combine batches: one initial all_reduce; fixed Exp100 before active profiler.step; no per-iteration prelude; operator-required coordination retained",
+                "measurement": {
+                    "device-barrier": "Combine raw-kernel ACL Event; dispatch complete Python API Event",
+                    "event": "device Event intervals for complete Python API calls",
+                    "profiler": "torch_npu profiler kernel tasks; diagnostic instrumentation may perturb latency",
+                }[args.perf_timer],
+                "alignment": {
+                    "device-barrier": ("CANN Notify submission gate -> HCCL all_reduce(MAX) + Work.wait + Host queue drain -> start Event -> Combine -> end Event; release Notify after all tasks are submitted"
+                                       if args.backend == "rdma" else
+                                       "on-stream ACLSHMEM all-rank barrier before Events"),
+                    "event": "per-iteration host completion boundary outside each device Event interval",
+                    "profiler": "one initial all_reduce and fixed Exp100 before the active profiler step",
+                }[args.perf_timer],
                 "results": results,
             }
             write_reports(args.run_directory, report)
