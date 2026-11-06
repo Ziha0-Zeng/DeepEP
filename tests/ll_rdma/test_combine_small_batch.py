@@ -59,7 +59,7 @@ template<uint32_t Group>struct Original {
  template<HardEvent E>void Sync(){SetFlag<E>(0U);WaitFlag<E>(0U);}
 ''' + original + r'''
 };
-template<uint32_t Group>void Check(uint32_t world,uint32_t rank,uint32_t c,uint32_t n,uint32_t h,uint32_t k,uint32_t pattern){
+template<uint32_t Group>void Check(uint32_t world,uint32_t rank,uint32_t c,uint32_t n,uint32_t h,uint32_t k,uint32_t pattern,bool crossHost=false){
  cores=c;const uint32_t recv=EpCombineRecvCoreCount(c);if(!recv)return;
  std::mt19937 rng(n*137+world+pattern);
  std::vector<int32_t> types(n),routes(n*3),hits(n,0);
@@ -80,7 +80,7 @@ template<uint32_t Group>void Check(uint32_t world,uint32_t rank,uint32_t c,uint3
   // M4 output events are already seeded by the caller; planning must leave
   // them untouched while using its own event directions.
   for(uint32_t lane=0;lane<8;++lane)SetFlag<HardEvent::MTE3_V>(lane);
-  bool ready=plan.Prepare({raw},bytes,owned,{types.data()},{routes.data()},n,world,rank,worker,recv);
+  bool ready=plan.Prepare({raw},bytes,owned,{types.data()},{routes.data()},n,world,rank,worker,recv,crossHost);
   for(uint32_t lane=0;lane<8;++lane)WaitFlag<HardEvent::MTE3_V>(lane);
   for(auto& direction:events)for(bool live:direction)assert(!live);
   assert(ready==(EpCombineM4ScanBytes(EpCombineAlign(n,64U))<=bytes));
@@ -94,7 +94,7 @@ template<uint32_t Group>void Check(uint32_t world,uint32_t rank,uint32_t c,uint3
   old.args_=&old.a;
   uint32_t owner=0;
   for(uint32_t step=0;step<world/Group;++step){
-   uint32_t group=CombineReturnServer<Group>(world/Group,rank/Group,step);
+   uint32_t group=CombineReturnServer<Group>(world/Group,rank/Group,step,crossHost);
    uint32_t count=old.SelectServer(group,owner,step==0);
    expected.insert(expected.end(),selected.begin(),selected.begin()+count);
    assert(plan.End(step)==expected.size());
@@ -139,6 +139,8 @@ int main(){
    Check<2>(2,pattern%2,c,n,3584,8,pattern);
    Check<4>(4,pattern,c,n,3584,8,pattern);
    Check<4>(8,pattern,c,n,3584,8,pattern);
+   Check<4>(8,pattern,c,n,3584,8,pattern,true);
+   Check<4>(8,pattern+4,c,n,3584,8,pattern,true);
    Check<16>(128,pattern*31,c,n,7168,16,pattern);
   }
  for(uint32_t world:{32,64,256})for(uint32_t n:{0,1,65,576})
@@ -196,7 +198,7 @@ def test_production_lane_events_and_payloads(tmp_path, optimized, returns):
 using namespace AscendC;
 using namespace CombineDedup;
 struct Args{uint32_t rank=0,rankSize=16;bool rdma=false;};
-namespace LlTransport {bool Rdma(Args* a){return a->rdma;} bool RemoteWrite(Args* a,uint32_t p){return a->rdma && p>=16;}}
+namespace LlTransport {bool Rdma(Args* a){return a->rdma;} uint32_t RanksPerHost(Args*){return 16U;} bool RemoteWrite(Args* a,uint32_t p){return a->rdma && p>=16;}}
 constexpr uint32_t kCombinePrepareRowBytes=72*32;
 constexpr uint64_t COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_PREPARE_DONE_OFFSET=0;
 constexpr uint64_t COMBINE_DEDUP_EP_SERVER_DEDUP_SHARED_DATA_OFFSET=0;

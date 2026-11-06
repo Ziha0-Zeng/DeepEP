@@ -58,7 +58,8 @@ def bash():
 
 
 def test_shell_syntax(bash):
-    for script in ("build.sh", "run.sh", "launch.sh", "prepare_shmem.sh", "hydra_proxy_command.sh"):
+    for script in ("build.sh", "run.sh", "launch.sh", "prepare_shmem.sh", "hydra_proxy_command.sh",
+                   "build_all.sh", "run_all.sh", "experiment_defaults.sh"):
         subprocess.run([bash, "-n", str(HERE / script)], check=True, timeout=10)
 
 
@@ -166,7 +167,7 @@ def test_per_node_launch_arguments(bash):
     for ep in (2, 4, 8, 16):
         result = subprocess.run([bash, str(HERE / "launch.sh"), "--ep", str(ep), "--variants", "base,opt",
                                  "--dry-run"], capture_output=True, text=True, check=True, timeout=10)
-        assert result.stdout.count(f"-ppn {ep} -n {ep}") == 2
+        assert result.stdout.count(f"-ppn {ep} -n {ep}") == 1
         assert "-launcher fork" in result.stdout
         assert "0-base" in result.stdout and "1-opt" in result.stdout
     for node in (0, 1):
@@ -176,7 +177,9 @@ def test_per_node_launch_arguments(bash):
                                 capture_output=True, text=True, check=True, timeout=10)
         assert f"--proxy-id {node}" in result.stdout
         assert "--control-port node0:31000" in result.stdout
-        assert "--control-port node0:31001" in result.stdout
+        assert "--control-port node0:31001" not in result.stdout
+        if node == 0:
+            assert "--variants base,opt" in result.stdout.replace("\\,", ",")
         assert ("-n 32" in result.stdout) == (node == 0)
         if node == 0:
             assert "HYDRA_LAUNCHER_AUTOFORK=0" in result.stdout
@@ -184,7 +187,7 @@ def test_per_node_launch_arguments(bash):
             assert "-launcher ssh -launcher-exec" in result.stdout
         assert "--launcher manual" not in result.stdout
     for args in (("--ep", "4", "--node-rank", "1"), ("--ep", "32"), ("--run-id", "../escape"),
-                 ("--master-port", "65535", "--variants", "base,opt"), ("--variants", "../escape"),
+                 ("--master-port", "65536", "--variants", "base,opt"), ("--variants", "../escape"),
                  ("--variants", "base,,opt")):
         result = subprocess.run([bash, str(HERE / "launch.sh"), *args, "--dry-run"],
                                 capture_output=True, timeout=10)
@@ -217,15 +220,22 @@ exit 1
     for variant in ("ref-profile", "opt-profile"):
         write(root / f"build/ll-cpp-{variant}/ll_combine_bench", r'''
 while (($#)); do
-    case $1 in --output-dir) out=$2;; --profile) level=$2;; --entry-sync) sync=$2;; esac
+    case $1 in --output-dir) root_out=$2;; --variants) variants=$2;; --profile) level=$2;; --entry-sync) sync=$2;; esac
     shift 2
 done
 [[ $level == 2 && $sync == device ]]
-mkdir -p "$out"
-for ((r=0;r<4;r++)); do echo passed >"$out/rank-$r.PASS"; done
-echo "${0%/ll_combine_bench}" >"$out/summary.csv"
-echo profile-fixture >"$out/rank-0-profile.csv"
+echo init >>"$root_out/initializations"
+IFS=, read -r -a phases <<< "$variants"
+for phase in "${!phases[@]}"; do
+    out="$root_out/$phase-${phases[$phase]}"
+    mkdir -p "$out"
+    for ((r=0;r<4;r++)); do echo passed >"$out/rank-$r.PASS"; done
+    echo "ll-cpp-${phases[$phase]}" >"$out/summary.csv"
+    echo profile-fixture >"$out/rank-0-profile.csv"
+done
 ''')
+    for variant in ("ref-profile", "opt-profile"):
+        (root / f"build/ll-cpp-{variant}/libll_bench_variant.so").touch()
     write(script.with_name("summarize.sh"), 'echo "profile-summary: $1"\n')
     helper_path = subprocess.check_output([bash, "-c", 'cygpath -u "$1"' if os.name == "nt" else 'printf "%s" "$1"',
                                           "_", helpers.as_posix()], text=True).strip()
@@ -241,13 +251,14 @@ echo profile-fixture >"$out/rank-0-profile.csv"
     runs = list((root / "results/ll-cpp/repeat").iterdir())
     assert len(runs) == 2
     for run in runs:
+        assert (run / "initializations").read_text().splitlines() == ["init"]
+        assert (run / "node-0/suite.log").exists()
         for phase, variant in enumerate(("ref-profile", "opt-profile")):
             output = run / f"{phase}-{variant}"
             assert len(list(output.glob("rank-*.PASS"))) == 4
             assert f"ll-cpp-{variant}" in (output / "summary.csv").read_text()
             assert (output / "rank-0-profile.csv").read_text().strip() == "profile-fixture"
             assert (output / "profile-summary-node-0.txt").exists()
-            assert (run / "node-0" / f"{phase}-{variant}.log").exists()
 
 
 def test_hydra_command_launcher_only_prints(bash, tmp_path):
@@ -285,6 +296,7 @@ def test_two_node_script_sequence_with_fake_hydra(bash, tmp_path, failure):
         path.chmod(0o755)
     for variant in ("base", "opt"):
         write(root / f"build/ll-cpp-{variant}/ll_combine_bench", "exit 0\n")
+        (root / f"build/ll-cpp-{variant}/libll_bench_variant.so").touch()
     # Git Bash lacks setsid on some Windows installations. Process-group and
     # signal behavior belongs to Linux validation; this test checks orchestration.
     helpers = tmp_path / "helpers"
@@ -295,7 +307,7 @@ if [[ ${1:-} == -version ]]; then echo '    Version: 3.2.1'; exit 0; fi
 [[ $HYDRA_LAUNCHER_AUTOFORK == 0 ]]
 port=${MPIEXEC_PORT_RANGE%:*}
 while (($#)); do
-    case $1 in -launcher) launcher=$2;; -launcher-exec) launcher_exec=$2;; esac
+    case $1 in -launcher) launcher=$2;; -launcher-exec) launcher_exec=$2;; --variants) variants=$2;; esac
     if [[ $1 == --output-dir ]]; then out=$2; break; fi
     shift
 done
@@ -312,8 +324,13 @@ for ((i=0;i<200;i++)); do
 done
 [[ -f "$FAKE_SHARED/join-$port-0" && -f "$FAKE_SHARED/join-$port-1" ]]
 if [[ ${FAKE_FAIL:-0} == 1 ]]; then touch "$FAKE_SHARED/done-$port"; exit 17; fi
-for ((r=0;r<32;r++)); do echo passed >"$out/rank-$r.PASS"; done
-echo summary >"$out/summary.csv"
+IFS=, read -r -a phases <<< "$variants"
+for phase in "${!phases[@]}"; do
+    phase_out="$out/$phase-${phases[$phase]}"
+    mkdir -p "$phase_out"
+    for ((r=0;r<32;r++)); do echo passed >"$phase_out/rank-$r.PASS"; done
+    echo summary >"$phase_out/summary.csv"
+done
 touch "$FAKE_SHARED/done-$port"
 ''')
     write(mpi / "bin/hydra_pmi_proxy", r'''
@@ -356,4 +373,4 @@ exit 1
                 proc.kill()
                 proc.wait(timeout=5)
     assert (shared / "controller-29671").exists()
-    assert (shared / "controller-29672").exists() == (failure == 0)
+    assert not (shared / "controller-29672").exists()

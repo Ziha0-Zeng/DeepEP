@@ -49,6 +49,11 @@ endforeach()
 list(APPEND _ll_sources
     "${DEEPEP_SOURCE_DIR}/csrc/kernels/dispatch/low_latency/variants/fp16_g2.cpp"
     "${DEEPEP_SOURCE_DIR}/csrc/kernels/dispatch/low_latency/variants/bf16_g2.cpp")
+if(DEEPEP_LL_OPS_BASE)
+    # This independent baseline needs no DeepEP Dispatch or Combine objects.
+    set(_ll_sources "${DEEPEP_SOURCE_DIR}/tests/ll_cpp_bench/ops_shmem/device.cpp"
+                    "${DEEPEP_SOURCE_DIR}/tests/ll_cpp_bench/entry_gate.cpp")
+endif()
 add_library(deepep_kernel_ll_plain OBJECT ${_ll_sources})
 add_library(deepep_kernel_ll_reference OBJECT ${_ll_sources})
 set_target_properties(deepep_kernel_ll_plain deepep_kernel_ll_reference PROPERTIES EXCLUDE_FROM_ALL TRUE)
@@ -62,6 +67,14 @@ else()
     set(_ll_variant deepep_kernel_ll_plain)
 endif()
 add_library(deepep_kernels SHARED $<TARGET_OBJECTS:${_ll_variant}>)
+if(DEEPEP_DEVICE_OUTPUT_NAME)
+    set_target_properties(deepep_kernels PROPERTIES OUTPUT_NAME "${DEEPEP_DEVICE_OUTPUT_NAME}")
+endif()
+if(DEEPEP_DEVICE_LOCAL_SYMBOLS)
+    # Several independently compiled kernels coexist in the benchmark process.
+    # Keep each library's launch stubs and registration data bound to that library.
+    target_link_options(deepep_kernels PRIVATE -Wl,-Bsymbolic)
+endif()
 
 add_library(deepep_kernel_options INTERFACE)
 if(NOT DEFINED DEEPEP_LL_COMBINE_RECV_CORES)
@@ -106,6 +119,12 @@ target_include_directories(deepep_kernel_options INTERFACE
     "${_tikcpp}/tikcfw/impl" "${_tikcpp}/tikcfw/interface"
     "${SHMEM_ROOT}/include" "${SHMEM_ROOT}/src" "${SHMEM_ROOT}/src/device"
     "${SHMEM_ROOT}/src/device_simt")
+if(DEEPEP_LL_OPS_BASE)
+    target_include_directories(deepep_kernel_options INTERFACE "${LL_OPS_KERNEL_DIR}"
+        "${DEEPEP_SOURCE_DIR}/tests/ll_cpp_bench/ops_shmem"
+        "${ASCEND_HOME_PATH}/include/op_common" "${ASCEND_HOME_PATH}/pkg_inc/op_common"
+        "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include/op_common")
+endif()
 if(DEVICE_RT_INCLUDE)
     target_include_directories(deepep_kernel_options INTERFACE "${DEVICE_RT_INCLUDE}")
     message(STATUS "Device runtime compatibility headers: ${DEVICE_RT_INCLUDE}")

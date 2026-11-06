@@ -43,62 +43,35 @@ Combine 已有有效 token 的待处理列表和可选 FIRST_HOP 任务缓存。
 
 ## 编译与运行
 
-两台机器更新同一分支，沿用已加载的 CANN、MPI 和 SHMEM 环境。重新编译下面四个目录，以统一新的打点字段；无需重新编译 SDK，也无需安装 Python 包。
+两台机器更新同一分支后，运行无参数编译脚本。它默认编译干净的 base，以及本节的 4 个打点版本；此前的任务缓存、分核和提前归约实验改为按需编译。脚本复用已安装的配套 SDK，无需安装 Python 包。构建列表和默认环境路径见 [C++ 用例说明](README.md#一次编译并运行当前实验)。
 
 ```bash
 git pull --ff-only origin perf/ll-combine-small-batch
-
-bash tests/ll_cpp_bench/build.sh \
-    --shmem-root "$SHMEM_ROOT" --mpi-home "$MPI_HOME" \
-    --build-dir "$PWD/build/ll-cpp-ref-profile" --variant opt --profile ON \
-    --small-batch OFF --recv-cores 0 --early-reduce OFF \
-    --remote-first OFF --defer-return OFF
-
-bash tests/ll_cpp_bench/build.sh \
-    --shmem-root "$SHMEM_ROOT" --mpi-home "$MPI_HOME" \
-    --build-dir "$PWD/build/ll-cpp-remote-profile" --variant opt --profile ON \
-    --small-batch OFF --recv-cores 0 --early-reduce OFF \
-    --remote-first ON --defer-return OFF
-
-bash tests/ll_cpp_bench/build.sh \
-    --shmem-root "$SHMEM_ROOT" --mpi-home "$MPI_HOME" \
-    --build-dir "$PWD/build/ll-cpp-pipeline-profile" --variant opt --profile ON \
-    --small-batch OFF --recv-cores 0 --early-reduce OFF \
-    --remote-first OFF --defer-return ON
-
-bash tests/ll_cpp_bench/build.sh \
-    --shmem-root "$SHMEM_ROOT" --mpi-home "$MPI_HOME" \
-    --build-dir "$PWD/build/ll-cpp-return-profile" --variant opt --profile ON \
-    --small-batch OFF --recv-cores 0 --early-reduce OFF \
-    --remote-first ON --defer-return ON
+bash tests/ll_cpp_bench/build_all.sh
 ```
 
-先用原来的单机命令做 EP4 或 EP16 冒烟，再在两台机器测试 EP32。第一台设置 `HOST0`、`HOST1` 后执行下面命令，并把打印的 `RUN_ID` 复制给第二台。
+默认双机地址为 `90.90.93.84` 和 `90.90.93.184`。第一台执行：
 
 ```bash
-RUN_ID="ep32-return-$(date +%Y%m%d-%H%M%S)-$$"
-printf '第二台设置 RUN_ID=%s\n' "$RUN_ID"
-bash tests/ll_cpp_bench/launch.sh \
-    --ep 32 --node-rank 0 --hosts "$HOST0,$HOST1" \
-    --master-addr "$HOST0" --master-port 29671 \
-    --variants ref-profile,remote-profile,pipeline-profile,return-profile \
-    --run-id "$RUN_ID" -- \
-    --tokens 32,48,64,72 --hidden 3584 --topk 8 --experts 384 --capacity 256 \
-    --dtype bf16 --route random --seed 0 --entry-sync host \
-    --warmup 10 --iters 10 --profile 2
+bash tests/ll_cpp_bench/run_all.sh
 ```
 
-第二台设置相同的 `HOST0`、`HOST1` 和本轮 `RUN_ID`，执行：
+第一台打印 `RUN_ID` 和第二台的加入命令。第二台只需复制该命令：
 
 ```bash
-bash tests/ll_cpp_bench/launch.sh \
-    --ep 32 --node-rank 1 --hosts "$HOST0,$HOST1" \
-    --master-addr "$HOST0" --master-port 29671 \
-    --variants ref-profile,remote-profile,pipeline-profile,return-profile \
-    --run-id "$RUN_ID"
+bash tests/ll_cpp_bench/run_all.sh 第一台打印的RUN_ID
 ```
 
-脚本自动打印各 BS 的时延和打点汇总。双机每次使用共同的新 `RUN_ID`，保留旧数据。第二次可反序运行四版，检查测试顺序的影响。最后用 `--profile OFF` 编译有价值的组合，比较完整 Event 性能。
+默认对比本节的 4 个打点版本，测试 BS32、48、64、72 和 256。形状为 H3584、TopK 8、384 个专家、BF16、随机路由、seed 0；每个 BS 预热 10 轮、采样 10 轮，启用二级打点。脚本自动打印各 BS 的时延和打点汇总。每次从第一台启动都会生成新的 `RUN_ID`，保留此前数据。
+
+默认顺序为对照、优先跨机回传、暂存流水和组合版。第二轮可以反序运行，检查先后顺序对结果的影响。第一台执行以下命令，第二台复制脚本打印的加入命令：
+
+```bash
+bash tests/ll_cpp_bench/run_all.sh \
+    --variants return-profile,pipeline-profile,remote-profile,ref-profile
+```
+
+用 `--ep 4 --devices 6,7,14,15` 或 `--ep 16` 可以先做单机冒烟。主机地址、端口、编译并行度和形状参数都可覆盖，详见两个脚本的 `--help`。确认有收益后，用原有 `build.sh --profile OFF` 编译对应组合，再比较完整 Event 性能。
 
 ## 新增打点怎么看
 

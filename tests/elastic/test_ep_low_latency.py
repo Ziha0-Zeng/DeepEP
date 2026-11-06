@@ -1451,8 +1451,23 @@ def worker(local_rank, args):
     cases = list(matrix_cases(args))
     torch.npu.set_device(local_rank)
     torch.set_num_threads(1)
-    helpers = runpy.run_path(str(Path(__file__).with_name("test_dispatch.py")))
-    deep_ep = helpers["_import_installed_deep_ep"]()
+    variant_root = os.environ.get('DEEPEP_LL_EXPERIMENT_PACKAGE')
+    if variant_root:
+        variant_root = Path(variant_root).resolve()
+        if not variant_root.is_relative_to(PROJECT_ROOT / 'variants'):
+            raise RuntimeError('Experiment package must be inside this worktree variants directory')
+        sys.path.insert(0, str(variant_root))
+        import deep_ep
+        if Path(deep_ep.__file__).resolve().parent != variant_root / 'deep_ep':
+            raise RuntimeError('Wrong experiment package imported')
+        experiment_info = json.loads(Path(deep_ep.__file__).with_name('_build_info.json').read_text())
+        if any(experiment_info.get(k) is not False for k in ('ll_reference_profile', 'll_stage_timer')):
+            raise RuntimeError('Reference and legacy tracing must be compiled OFF')
+        if experiment_info.get('ll_combine_profile') != bool(args.combine_profile_level):
+            raise RuntimeError('Combine profile build must exactly match requested diagnostic mode')
+    else:
+        helpers = runpy.run_path(str(Path(__file__).with_name("test_dispatch.py")))
+        deep_ep = helpers["_import_installed_deep_ep"]()
     if rank == 0:
         print(f"[LL ST] Python: {sys.executable}; installed package: {deep_ep.__file__}", flush=True)
     from deep_ep._native import require_native
@@ -1503,6 +1518,15 @@ def worker(local_rank, args):
             capability.update(reference_profile=getattr(native, 'low_latency_reference_profile_enabled', None),
                               reference_profile_schema=native.low_latency_reference_profile_layout()['schema'],
                               installed_source_sha256=info.get('source_sha256'))
+        if variant_root:
+            capability['experiment_build'] = {
+                k: experiment_info[k] for k in ('ll_combine_small_batch', 'll_combine_recv_cores',
+                    'll_combine_early_reduce', 'll_combine_remote_first', 'll_combine_defer_return',
+                    'll_combine_profile', 'll_reference_profile', 'll_stage_timer')}
+            capability['experiment_build']['ll_combine_ready'] = experiment_info.get('ll_combine_ready', 0)
+            capability['experiment_build']['ll_combine_trim_idle'] = experiment_info.get('ll_combine_trim_idle', False)
+            capability['experiment_kernel_sha256'] = hashlib.sha256(
+                Path(deep_ep.__file__).with_name('libdeepep_kernels.so').read_bytes()).hexdigest()
         capabilities = [None] * world
         trace_call(args, "capability.all_gather", dist.all_gather_object, capabilities, capability)
         if any(item != capabilities[0] for item in capabilities):
@@ -1557,8 +1581,15 @@ def worker(local_rank, args):
             {"rank": rank, "world_size": world} if args.without_buffer_group else {"group": dist.group.WORLD}
         )
 
+        # Create and warm HCCL before SHMEM claims AICPU resources. This changes
+        # setup order only; the measured per-iteration HCCL callback is unchanged.
+        benchmark_gate = None
+        if args.perf_timer == "device-barrier" and args.backend == "rdma":
+            benchmark_gate = HcclBenchmarkGate(torch.device("npu", local_rank),
+                                              args.num_cpu_timeout_secs, args.benchmark_gate_delay_ms)
+
         def create_buffer(case):
-            return trace_call(
+            created = trace_call(
                 case,
                 "buffer.create",
                 deep_ep.ElasticBuffer,
@@ -1571,6 +1602,9 @@ def worker(local_rank, args):
                 num_cpu_timeout_secs=args.num_cpu_timeout_secs,
                 use_1g_huge_pages=(capability["transport"] != "rdma" if args.use_1g_huge_pages is None else bool(args.use_1g_huge_pages)),
             )
+            if benchmark_gate is not None:
+                created._ll_benchmark_gate = benchmark_gate
+            return created
 
         if not args.fresh_buffer_per_case:
             buffer = create_buffer(args)

@@ -434,7 +434,8 @@ private:
         profile_.Mark(CombineProfile::DirectSetupEnd);
         for (uint32_t step = 1U; step <= servers; ++step) {
             const uint64_t scanStart = profile_.DetailClock();
-            const uint32_t count = SelectDirectServer(CombineReturnServer<Group>(servers, ownServer, step - 1U));
+            const uint32_t count = SelectDirectServer(CombineReturnServer<Group>(servers, ownServer, step - 1U,
+                LlTransport::Rdma(args_) && LlTransport::RanksPerHost(args_) == Group));
             profile_.Elapsed(CombineProfile::DirectScanTicks, scanStart);
             const uint32_t first = ServerDedupFirstOwned(core_, owner, sendCores_);
             owner = (owner + count) % sendCores_;

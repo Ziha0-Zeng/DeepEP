@@ -90,7 +90,8 @@ public:
     {
         planned_ = plan_.Prepare(planScratch_, planScratchBytes_, rows_, types_, table2_, tokens_,
                                  uint32_t(args_->rankSize), uint32_t(args_->rank),
-                                 GetBlockIdx() - (GetBlockNum() - recvCores_), recvCores_);
+                                 GetBlockIdx() - (GetBlockNum() - recvCores_), recvCores_,
+                                 LlTransport::Rdma(args_) && LlTransport::RanksPerHost(args_) == Group);
     }
 #endif
 
@@ -112,12 +113,14 @@ public:
 #ifdef DEEPEP_LL_COMBINE_SMALL_BATCH
             const uint32_t begin = planned_ && step > 1U ? plan_.End(step - 2U) : 0U;
             const uint32_t end = planned_ ? plan_.End(step - 1U)
-                : SelectServer(CombineReturnServer<Group>(servers, ownServer, step - 1U), owner, step == 1U);
+                : SelectServer(CombineReturnServer<Group>(servers, ownServer, step - 1U,
+                    LlTransport::Rdma(args_) && LlTransport::RanksPerHost(args_) == Group), owner, step == 1U);
             const uint32_t taskEnd = end;
             profile_.Elapsed(CombineProfile::PartialScanTicks, scanStart);
             for (uint32_t task = begin; task < end; ++task) {
 #else
-            const uint32_t count = SelectServer(CombineReturnServer<Group>(servers, ownServer, step - 1U), owner, step == 1U);
+            const uint32_t count = SelectServer(CombineReturnServer<Group>(servers, ownServer, step - 1U,
+                LlTransport::Rdma(args_) && LlTransport::RanksPerHost(args_) == Group), owner, step == 1U);
             const uint32_t taskEnd = count;
             profile_.Elapsed(CombineProfile::PartialScanTicks, scanStart);
             for (uint32_t task = 0; task < count; ++task) {

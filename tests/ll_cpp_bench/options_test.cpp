@@ -15,7 +15,7 @@ int main()
         char* argv[] = {name};
         auto small = llbench::Options::parse(1, argv, world - 1, world, world - 1);
         assert(small.device == world - 1 && small.world == world);
-        assert(small.entrySync == "device" && small.tokens == std::vector<uint32_t>({32, 48, 64, 72}));
+        assert(small.entrySync == "device" && small.tokens == std::vector<uint32_t>({32, 48, 64, 72, 256}));
     }
     auto o = parse({"bench", "--tokens", "1,72", "--dtype", "fp16"});
     assert(o.profile == 0);

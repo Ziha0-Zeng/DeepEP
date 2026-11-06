@@ -8,7 +8,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
-#include "runtime/session.hpp"
+#include "variant_api.hpp"
 #include "runtime/ll_core_config.hpp"
 #include "host/mem/shmem_host_heap.h"
 #include "host/data_plane/shmem_host_rma.h"
@@ -104,28 +104,28 @@ struct EntryGate {
         check(aclrtSynchronizeStream(control), "gate release completion");
     }
 };
-uint8_t* local_base(deepep::Session& session)
+uint8_t* local_base(const llbench::Runtime& session)
 {
-    return static_cast<uint8_t*>(session.workspace()) + uint64_t(session.rank()) * 1024U;
+    return static_cast<uint8_t*>(session.workspace) + uint64_t(session.options.rank) * 1024U;
 }
-DispatchDedup::CommArgs comm_args(deepep::Session& session)
+DispatchDedup::CommArgs comm_args(const llbench::Runtime& session)
 {
     DispatchDedup::CommArgs args{};
-    args.rank = session.rank();
-    args.rankSize = session.world();
-    args.localRankSize = DispatchDedup::LlGroupForWorld(session.world());
-    args.localRank = session.rank() % args.localRankSize;
+    args.rank = session.options.rank;
+    args.rankSize = session.options.world;
+    args.localRankSize = DispatchDedup::LlGroupForWorld(session.options.world);
+    args.localRank = session.options.rank % args.localRankSize;
     args.reserved0 = DispatchDedup::kLlPhysicalRanksPerHost;
-    args.peerMemBytes = session.capacity();
-    args.fftsVal = shmemx_get_ffts_config();
-    args.reservedAddresses[0] = static_cast<uint8_t*>(session.workspace());
-    args.reservedAddresses[1] = static_cast<uint8_t*>(session.ll_rdma_stage());
+    args.peerMemBytes = session.capacity;
+    args.fftsVal = session.ffts;
+    args.reservedAddresses[0] = static_cast<uint8_t*>(session.workspace);
+    args.reservedAddresses[1] = static_cast<uint8_t*>(session.rdmaStage);
     args.reservedConfig[0] = LlRdma::kBackend;
-    args.reservedConfig[1] = session.ll_rdma_qps();
-    for (int peer = 0; peer < session.world(); ++peer) {
-        if (!DispatchDedup::LlSameHost(session.rank(), peer)) continue;
-        auto base = static_cast<uint8_t*>(peer == session.rank() ? session.workspace()
-                                                                 : aclshmem_ptr(session.workspace(), peer));
+    args.reservedConfig[1] = session.rdmaQps;
+    for (int peer = 0; peer < session.options.world; ++peer) {
+        if (!DispatchDedup::LlSameHost(session.options.rank, peer)) continue;
+        auto base = static_cast<uint8_t*>(peer == session.options.rank ? session.workspace
+                                                                       : aclshmem_ptr(session.workspace, peer));
         if (!base) throw std::runtime_error("Missing local MTE mapping");
         args.peerMems[peer] = base + uint64_t(peer) * 1024U;
     }
@@ -240,217 +240,174 @@ struct Case {
         return worst;
     }
 };
-void help()
-{
-    std::cout << "LL Combine C++ benchmark (use run.sh for one process per card)\n"
-                 "MPI assigns EP2/4/8/16/32; --devices lists one device per local rank\n"
-                 "--tokens 32,48,64,72 --hidden 3584 --topk 8 --experts 384 --capacity 256\n"
-                 "--entry-sync auto|device|host (auto: single-host device gate/barrier, multi-host MPI only)\n"
-                 "--profile 0|1|2 --dtype bf16|fp16 --route random|hotspot --seed 0 --warmup 10 --iters 100 --timeout "
-                 "300 --output-dir DIR\n";
-}
 }  // namespace
-int main(int argc, char** argv)
+
+LL_BENCH_EXPORT void ll_bench_run(const llbench::Runtime* shared)
 {
-    if (argc == 2 && std::string(argv[1]) == "--help") {
-        help();
-        return 0;
+    static_assert(llbench::workspaceBytes == DispatchDedup::kEpServerDedupPeerBytes);
+    const auto& session = *shared;
+    const auto& peers = *shared->peers;
+    const auto& o = shared->options;
+    const auto stream = shared->stream;
+    const auto cores = shared->cores;
+    if (DEEPEP_LL_COMBINE_ORIGINAL && o.world == 2)
+        throw std::runtime_error("Unmodified upstream Combine supports G4/G16; use --variant opt for EP2 smoke tests");
+    const auto recv = CombineDedup::EpCombineRecvCoreCount(cores);
+    if (!recv || deepep_ll_combine_recv_cores() != DEEPEP_LL_COMBINE_RECV_CORES ||
+        bool(deepep_ll_combine_early_reduce_enabled()) != CombineDedup::EpCombineEarlyReduce(1))
+        throw std::runtime_error("Unsupported receive-core count or mismatched Host/device build");
+    const bool profileBuild = deepep_ll_combine_profile_enabled() != 0;
+    const uint32_t returnOptions = deepep_ll_combine_return_options();
+    if (returnOptions != (DEEPEP_BENCH_REMOTE_FIRST | (DEEPEP_BENCH_DEFER_RETURN << 1)))
+        throw std::runtime_error("Mismatched Host/device return options");
+    if (o.profile && !profileBuild)
+        throw std::runtime_error("Rebuild with build.sh --profile ON before requesting device diagnostics");
+    std::ostringstream identity;
+    identity << o.signature() << '/' << cores << '/' << DEEPEP_BENCH_SOURCE_ID << '/'
+             << deepep_ll_combine_small_batch_enabled() << '/' << deepep_ll_combine_recv_cores() << '/'
+             << deepep_ll_combine_early_reduce_enabled() << '/' << profileBuild << '/' << DEEPEP_LL_COMBINE_ORIGINAL
+             << '/' << returnOptions;
+    peers.verify(llbench::hash(identity.str()));
+    check(aclrtSynchronizeStream(stream), "initial completion");
+    peers.barrier();
+    auto hostComm = comm_args(session);
+    Buffer comm(sizeof(hostComm));
+    comm.upload(&hostComm, sizeof(hostComm));
+    std::unique_ptr<EntryGate> gate;
+    if (o.entrySync == "device") {
+        // Complete first-use SDK setup before blocking the compute stream.
+        check(aclshmemx_barrier_on_stream(ACLSHMEM_TEAM_WORLD, stream), "prime device entry barrier");
+        check(aclrtSynchronizeStream(stream), "entry barrier preparation");
+        gate = std::make_unique<EntryGate>();
     }
-    if (MPI_Init(&argc, &argv) != MPI_SUCCESS) {
-        std::cerr << "MPI_Init failed\n";
-        return 1;
+    std::filesystem::create_directories(o.output);
+    auto rankPath = std::filesystem::path(o.output) / ("rank-" + std::to_string(o.rank) + ".csv");
+    if (std::filesystem::exists(rankPath)) throw std::runtime_error("Result exists; choose a new output directory");
+    std::ofstream samples(rankPath);
+    if (!samples) throw std::runtime_error("Cannot open rank output");
+    samples << "tokens,iteration,combine_event_us,original,entry_sync,profile_build,profile_level\n";
+    samples << std::fixed << std::setprecision(3);
+    std::ofstream profileCsv;
+    if (o.profile) {
+        profileCsv.open(std::filesystem::path(o.output) / ("rank-" + std::to_string(o.rank) + "-profile.csv"));
+        if (!profileCsv) throw std::runtime_error("Cannot open profile output");
+        llbench::profile_header(profileCsv);
     }
-    try {
-        llbench::Coordinator peers;
-        auto o = llbench::Options::parse(argc, argv, peers.rank, peers.world, peers.localRank);
-        if (DEEPEP_LL_COMBINE_ORIGINAL && o.world == 2)
-            throw std::runtime_error(
-                "Unmodified upstream Combine supports G4/G16; use --variant opt for EP2 smoke tests");
-        check(aclInit(nullptr), "aclInit");
-        check(aclrtSetDevice(o.device), "aclrtSetDevice");
-        aclrtStream stream = nullptr;
-        check(aclrtCreateStream(&stream), "create stream");
-        const uint32_t cores = deepep::query_ll_core_config().active;
-        const auto recv = CombineDedup::EpCombineRecvCoreCount(cores);
-        if (!recv || deepep_ll_combine_recv_cores() != DEEPEP_LL_COMBINE_RECV_CORES ||
-            bool(deepep_ll_combine_early_reduce_enabled()) != CombineDedup::EpCombineEarlyReduce(1))
-            throw std::runtime_error("Unsupported receive-core count or mismatched Host/device build");
-        const bool profileBuild = deepep_ll_combine_profile_enabled() != 0;
-        const uint32_t returnOptions = deepep_ll_combine_return_options();
-        if (returnOptions != (DEEPEP_BENCH_REMOTE_FIRST | (DEEPEP_BENCH_DEFER_RETURN << 1)))
-            throw std::runtime_error("Mismatched Host/device return options");
-        if (o.profile && !profileBuild)
-            throw std::runtime_error("Rebuild with build.sh --profile ON before requesting device diagnostics");
-        std::ostringstream identity;
-        identity << o.signature() << '/' << cores << '/' << DEEPEP_BENCH_SOURCE_ID << '/'
-                 << deepep_ll_combine_small_batch_enabled() << '/' << deepep_ll_combine_recv_cores() << '/'
-                 << deepep_ll_combine_early_reduce_enabled() << '/' << profileBuild << '/'
-                 << DEEPEP_LL_COMBINE_ORIGINAL << '/' << returnOptions;
-        peers.verify(llbench::hash(identity.str()));
-        setenv("DEEPEP_LL_BACKEND", "rdma", 1);
-        {
-            deepep::Session session(o.rank, o.world, DispatchDedup::kEpServerDedupPeerBytes, "", o.timeout, false,
-                                    false, true);
-            check(aclrtSynchronizeStream(stream), "initial completion");
-            peers.barrier();
-            auto hostComm = comm_args(session);
-            Buffer comm(sizeof(hostComm));
-            comm.upload(&hostComm, sizeof(hostComm));
-            std::unique_ptr<EntryGate> gate;
-            if (o.entrySync == "device") {
-                // Complete first-use SDK setup before blocking the compute stream.
-                check(aclshmemx_barrier_on_stream(ACLSHMEM_TEAM_WORLD, stream), "prime device entry barrier");
-                check(aclrtSynchronizeStream(stream), "entry barrier preparation");
-                gate = std::make_unique<EntryGate>();
-            }
-            std::filesystem::create_directories(o.output);
-            auto rankPath = std::filesystem::path(o.output) / ("rank-" + std::to_string(o.rank) + ".csv");
-            if (std::filesystem::exists(rankPath))
-                throw std::runtime_error("Result exists; choose a new output directory");
-            std::ofstream samples(rankPath);
-            if (!samples) throw std::runtime_error("Cannot open rank output");
-            samples << "tokens,iteration,combine_event_us,original,entry_sync,profile_build,profile_level\n";
-            samples << std::fixed << std::setprecision(3);
-            std::ofstream profileCsv;
-            if (o.profile) {
-                profileCsv.open(std::filesystem::path(o.output) / ("rank-" + std::to_string(o.rank) + "-profile.csv"));
-                if (!profileCsv) throw std::runtime_error("Cannot open profile output");
-                llbench::profile_header(profileCsv);
-            }
-            std::ofstream summary;
-            if (o.rank == 0) {
-                summary.open(std::filesystem::path(o.output) / "summary.csv");
-                if (!summary) throw std::runtime_error("Cannot open summary");
-                summary << "ep,tokens,hidden,topk,experts,dtype,route,seed,capacity,warmup,source_id,samples,active_"
-                           "aiv,recv_cores,small_batch,early_"
-                           "reduce,remote_first,defer_return,original,entry_sync,profile_build,profile_level,rank_max_mean_us,rank_max_min_us,"
-                           "rank_max_max_us,p50_us,p99_us\n";
-            }
-            std::cout << "rank=" << o.rank << " EP=" << o.world << " AIV=" << cores << " receive=" << recv
-                      << " small_batch=" << deepep_ll_combine_small_batch_enabled()
-                      << " early_reduce=" << deepep_ll_combine_early_reduce_enabled()
-                      << " remote_first=" << (returnOptions & 1U) << " defer_return=" << ((returnOptions >> 1) & 1U)
-                      << " original=" << DEEPEP_LL_COMBINE_ORIGINAL << " entry_sync=" << o.entrySync
-                      << " profile_build=" << profileBuild << " profile_level=" << o.profile << std::endl;
-            if (o.rank == 0 && profileBuild)
-                std::cout << "Diagnostic build: use --profile OFF when rebuilding for clean Event performance."
-                          << std::endl;
-            for (auto bs : o.tokens) {
-                Case c(o, bs, cores, comm.p);
-                peers.barrier();
-                dispatch_server_dedup_kernel_do_v2(stream, &c.dispatch, c.variant);
-                check(aclrtSynchronizeStream(stream), "Dispatch completion");
-                peers.barrier();
-                const uint64_t blocks = uint64_t(bs) * o.topk * ((uint64_t(o.hidden) * 2 + 479) / 480);
-                combine_clear_result_flags_kernel_do(stream, local_base(session), blocks, cores);
-                check(aclrtSynchronizeStream(stream), "Combine window preparation");
-                peers.barrier();
-                auto launch = [&]() { combine_server_dedup_kernel_do(stream, &c.combine); };
-                launch();
-                check(aclrtSynchronizeStream(stream), "correctness Combine");
-                auto error = c.precision(o.dtype == "bf16");
-                peers.barrier();
-                for (uint32_t i = 0; i < o.warmup; ++i) {
-                    if (gate)
-                        gate->enqueue(stream);
-                    else
-                        peers.barrier();
-                    launch();
-                    if (gate) {
-                        peers.barrier();
-                        gate->release();
-                    }
-                    check(aclrtSynchronizeStream(stream), "warmup");
-                }
-                std::vector<float> times;
-                times.reserve(o.iterations);
-                std::unique_ptr<Buffer> profileBuffer;
-                std::vector<uint64_t> profileData;
-                if (o.profile) {
-                    profileData.resize(size_t(cores) * CombineProfile::kWords);
-                    profileBuffer = std::make_unique<Buffer>(profileData.size() * sizeof(uint64_t));
-                    c.combine.stageTimer = profileBuffer->p;
-                    c.combine.timerMode = o.profile;
-                }
-                Event start, end;
-                for (uint32_t i = 0; i < o.iterations; ++i) {
-                    // Every peer completed its previous kernel before this barrier
-                    // releases either rotating bank. Host coordination is untimed.
-                    if (o.profile) {
-                        // Clear outside the Event so missing core exports cannot reuse an older sample.
-                        std::fill(profileData.begin(), profileData.end(), 0U);
-                        profileBuffer->upload(profileData.data(), profileBuffer->bytes);
-                    }
-                    if (gate)
-                        gate->enqueue(stream);
-                    else
-                        peers.barrier();
-                    start.record(stream);
-                    launch();
-                    end.record(stream);
-                    // Every rank has queued gate -> device barrier -> both Events
-                    // and Combine before Host releases any gate. MPI return skew
-                    // is absorbed by the device barrier outside the Event interval.
-                    if (gate) {
-                        peers.barrier();
-                        gate->release();
-                    }
-                    check(aclrtSynchronizeStream(stream), "sample completion");
-                    float ms = 0;
-                    check(aclrtEventElapsedTime(&ms, start.value, end.value), "event elapsed");
-                    if (!std::isfinite(ms) || ms <= 0) throw std::runtime_error("Invalid Event duration");
-                    times.push_back(ms * 1000);
-                    samples << bs << ',' << i << ',' << times.back() << ',' << DEEPEP_LL_COMBINE_ORIGINAL << ','
-                            << o.entrySync << ',' << profileBuild << ',' << o.profile << '\n';
-                    if (o.profile) {
-                        profileBuffer->download(profileData.data(), profileBuffer->bytes);
-                        llbench::profile_rows(profileCsv, profileData, cores, recv, o.rank, o.world, bs, o.device,
-                                              o.profile, i);
-                    }
-                }
-                c.precision(o.dtype == "bf16");
-                samples.flush();
-                if (o.profile) profileCsv.flush();
-                auto data = peers.gather(times.data(), times.size() * sizeof(float));
-                if (o.rank == 0) {
-                    std::vector<float> rankMax(o.iterations, 0);
-                    for (uint32_t r = 0; r < o.world; ++r)
-                        for (uint32_t i = 0; i < o.iterations; ++i) {
-                            float v;
-                            std::memcpy(&v, data.data() + (r * o.iterations + i) * sizeof(float), sizeof(float));
-                            rankMax[i] = std::max(rankMax[i], v);
-                        }
-                    auto s = llbench::stats(rankMax);
-                    summary << o.world << ',' << bs << ',' << o.hidden << ',' << o.topk << ',' << o.experts << ','
-                            << o.dtype << ',' << o.route << ',' << o.seed << ',' << o.capacity << ',' << o.warmup << ','
-                            << DEEPEP_BENCH_SOURCE_ID << ',' << o.iterations << ',' << cores << ',' << recv << ','
-                            << deepep_ll_combine_small_batch_enabled() << ','
-                            << deepep_ll_combine_early_reduce_enabled() << ',' << (returnOptions & 1U) << ','
-                            << ((returnOptions >> 1) & 1U) << ',' << DEEPEP_LL_COMBINE_ORIGINAL << ','
-                            << o.entrySync << ',' << profileBuild << ',' << o.profile << ',' << s.mean << ',' << s.min
-                            << ',' << s.max << ',' << s.p50 << ',' << s.p99 << '\n';
-                    summary.flush();
-                    std::cout << "BS=" << bs << " rank-MAX Event us: mean=" << s.mean << " range=[" << s.min << ','
-                              << s.max << "] p99=" << s.p99 << " rank0_max_abs_error=" << error << std::endl;
-                }
-                peers.barrier();
-            }
-            check(aclrtSynchronizeStream(stream), "final completion");
-            peers.barrier();
-            session.close(true);
-            peers.barrier();
-        }
-        check(aclrtDestroyStream(stream), "destroy stream");
-        check(aclrtResetDevice(o.device), "reset device context");
-        check(aclFinalize(), "aclFinalize");
+    std::ofstream summary;
+    if (o.rank == 0) {
+        summary.open(std::filesystem::path(o.output) / "summary.csv");
+        if (!summary) throw std::runtime_error("Cannot open summary");
+        summary << "ep,tokens,hidden,topk,experts,dtype,route,seed,capacity,warmup,source_id,samples,active_"
+                   "aiv,recv_cores,small_batch,early_"
+                   "reduce,remote_first,defer_return,original,entry_sync,profile_build,profile_level,rank_max_mean_us,"
+                   "rank_max_min_us,"
+                   "rank_max_max_us,p50_us,p99_us\n";
+    }
+    std::cout << "rank=" << o.rank << " EP=" << o.world << " AIV=" << cores << " receive=" << recv
+              << " small_batch=" << deepep_ll_combine_small_batch_enabled()
+              << " early_reduce=" << deepep_ll_combine_early_reduce_enabled()
+              << " remote_first=" << (returnOptions & 1U) << " defer_return=" << ((returnOptions >> 1) & 1U)
+              << " original=" << DEEPEP_LL_COMBINE_ORIGINAL << " entry_sync=" << o.entrySync
+              << " profile_build=" << profileBuild << " profile_level=" << o.profile << std::endl;
+    if (o.rank == 0 && profileBuild)
+        std::cout << "Diagnostic build: use --profile OFF when rebuilding for clean Event performance." << std::endl;
+    for (auto bs : o.tokens) {
+        Case c(o, bs, cores, comm.p);
         peers.barrier();
-        std::ofstream(std::filesystem::path(o.output) / ("rank-" + std::to_string(o.rank) + ".PASS"))
-            << "precision, sampling and SHMEM finalize passed\n";
-        llbench::mpi_check(MPI_Finalize(), "MPI_Finalize");
-        return 0;
-    } catch (const std::exception& e) {
-        std::cerr << "FAIL: " << e.what() << std::endl;
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return 1;
+        dispatch_server_dedup_kernel_do_v2(stream, &c.dispatch, c.variant);
+        check(aclrtSynchronizeStream(stream), "Dispatch completion");
+        peers.barrier();
+        const uint64_t blocks = uint64_t(bs) * o.topk * ((uint64_t(o.hidden) * 2 + 479) / 480);
+        combine_clear_result_flags_kernel_do(stream, local_base(session), blocks, cores);
+        check(aclrtSynchronizeStream(stream), "Combine window preparation");
+        peers.barrier();
+        auto launch = [&]() { combine_server_dedup_kernel_do(stream, &c.combine); };
+        launch();
+        check(aclrtSynchronizeStream(stream), "correctness Combine");
+        auto error = c.precision(o.dtype == "bf16");
+        peers.barrier();
+        for (uint32_t i = 0; i < o.warmup; ++i) {
+            if (gate)
+                gate->enqueue(stream);
+            else
+                peers.barrier();
+            launch();
+            if (gate) {
+                peers.barrier();
+                gate->release();
+            }
+            check(aclrtSynchronizeStream(stream), "warmup");
+        }
+        std::vector<float> times;
+        times.reserve(o.iterations);
+        std::unique_ptr<Buffer> profileBuffer;
+        std::vector<uint64_t> profileData;
+        if (o.profile) {
+            profileData.resize(size_t(cores) * CombineProfile::kWords);
+            profileBuffer = std::make_unique<Buffer>(profileData.size() * sizeof(uint64_t));
+            c.combine.stageTimer = profileBuffer->p;
+            c.combine.timerMode = o.profile;
+        }
+        Event start, end;
+        for (uint32_t i = 0; i < o.iterations; ++i) {
+            // Every peer completed its previous kernel before this barrier
+            // releases either rotating bank. Host coordination is untimed.
+            if (o.profile) {
+                // Clear outside the Event so missing core exports cannot reuse an older sample.
+                std::fill(profileData.begin(), profileData.end(), 0U);
+                profileBuffer->upload(profileData.data(), profileBuffer->bytes);
+            }
+            if (gate)
+                gate->enqueue(stream);
+            else
+                peers.barrier();
+            start.record(stream);
+            launch();
+            end.record(stream);
+            // Every rank has queued gate -> device barrier -> both Events
+            // and Combine before Host releases any gate. MPI return skew
+            // is absorbed by the device barrier outside the Event interval.
+            if (gate) {
+                peers.barrier();
+                gate->release();
+            }
+            check(aclrtSynchronizeStream(stream), "sample completion");
+            float ms = 0;
+            check(aclrtEventElapsedTime(&ms, start.value, end.value), "event elapsed");
+            if (!std::isfinite(ms) || ms <= 0) throw std::runtime_error("Invalid Event duration");
+            times.push_back(ms * 1000);
+            samples << bs << ',' << i << ',' << times.back() << ',' << DEEPEP_LL_COMBINE_ORIGINAL << ',' << o.entrySync
+                    << ',' << profileBuild << ',' << o.profile << '\n';
+            if (o.profile) {
+                profileBuffer->download(profileData.data(), profileBuffer->bytes);
+                llbench::profile_rows(profileCsv, profileData, cores, recv, o.rank, o.world, bs, o.device, o.profile,
+                                      i);
+            }
+        }
+        c.precision(o.dtype == "bf16");
+        samples.flush();
+        if (o.profile) profileCsv.flush();
+        auto data = peers.gather(times.data(), times.size() * sizeof(float));
+        if (o.rank == 0) {
+            std::vector<float> rankMax(o.iterations, 0);
+            for (uint32_t r = 0; r < o.world; ++r)
+                for (uint32_t i = 0; i < o.iterations; ++i) {
+                    float v;
+                    std::memcpy(&v, data.data() + (r * o.iterations + i) * sizeof(float), sizeof(float));
+                    rankMax[i] = std::max(rankMax[i], v);
+                }
+            auto s = llbench::stats(rankMax);
+            summary << o.world << ',' << bs << ',' << o.hidden << ',' << o.topk << ',' << o.experts << ',' << o.dtype
+                    << ',' << o.route << ',' << o.seed << ',' << o.capacity << ',' << o.warmup << ','
+                    << DEEPEP_BENCH_SOURCE_ID << ',' << o.iterations << ',' << cores << ',' << recv << ','
+                    << deepep_ll_combine_small_batch_enabled() << ',' << deepep_ll_combine_early_reduce_enabled() << ','
+                    << (returnOptions & 1U) << ',' << ((returnOptions >> 1) & 1U) << ',' << DEEPEP_LL_COMBINE_ORIGINAL
+                    << ',' << o.entrySync << ',' << profileBuild << ',' << o.profile << ',' << s.mean << ',' << s.min
+                    << ',' << s.max << ',' << s.p50 << ',' << s.p99 << '\n';
+            summary.flush();
+            std::cout << "BS=" << bs << " rank-MAX Event us: mean=" << s.mean << " range=[" << s.min << ',' << s.max
+                      << "] p99=" << s.p99 << " rank0_max_abs_error=" << error << std::endl;
+        }
+        peers.barrier();
     }
 }

@@ -8,14 +8,16 @@ namespace CombineDedup {
 #define COMBINE_RETURN_INLINE inline
 #endif
 // Move the local physical host to the end, preserving the relative order of
-// all remote hosts. G2/G4 are single-host paths and retain their original order.
+// all remote hosts. G4 may represent a physical four-rank host in cross-host
+// EP8; callers explicitly admit that case. Single-host G2/G4 stay unchanged.
 // Task ownership follows this traversal, so an enabled build also redistributes
 // individual tasks among the same set of per-core QPs.
 template<uint32_t Group>
-COMBINE_RETURN_INLINE uint32_t CombineReturnServer(uint32_t servers, uint32_t own, uint32_t ordinal)
+COMBINE_RETURN_INLINE uint32_t CombineReturnServer(uint32_t servers, uint32_t own, uint32_t ordinal,
+                                                 bool crossHostGroup = false)
 {
 #ifdef DEEPEP_LL_COMBINE_REMOTE_FIRST
-    if constexpr (Group == 16U) {
+    if (Group == 16U || (Group == 4U && crossHostGroup)) {
         if (servers > 1U) {
             const uint32_t split = servers / 2U;
             const uint32_t ownLength = own < split ? split : servers - split;
