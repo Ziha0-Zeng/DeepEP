@@ -9,19 +9,21 @@
 
 namespace ascend_deepep::udma {
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
-template <uint32_t Capacity, uint32_t Phase, uint32_t Qps, class Resource>
+template <uint32_t Capacity, uint32_t Phase, uint32_t Qps, class Resource,
+          uint32_t BatchWqes = kBatchWqes, bool Direct = false>
 __aicore__ inline void CombineRemoteImpl(
     Resource& resource, GM_ADDR x, GM_ADDR weights, GM_ADDR src_idx, GM_ADDR rank_prefix, GM_ADDR channel_prefix,
     GM_ADDR workspace, const CombineTilingData& td, uint32_t core)
 {
-    constexpr uint32_t sender_bytes = kHeadersOffset + Capacity * Qps * (2U * kWqeBytes + sizeof(uint64_t));
+    constexpr uint32_t headers_offset = BatchWqes * (kWqeBytes + 4U * sizeof(uint64_t));
+    constexpr uint32_t sender_bytes = headers_offset + Capacity * Qps * (2U * kWqeBytes + sizeof(uint64_t));
     static_assert(sender_bytes + Capacity * kTileTokens * sizeof(int32_t) <= platform::kKernelUbBytes);
     auto wq = resource.template GetBufferByByte<uint8_t>(0);
     auto indices = resource.template GetBufferByByte<int32_t>(sender_bytes);
     const bool simt_weights = Phase == 0 && CombineSimtWeightsEnabled(td);
     if (simt_weights)
         CombineRemoteWeights(weights, src_idx, rank_prefix, workspace, td, core);
-    CombineSenderT<Capacity, Qps> sender(td, core, reinterpret_cast<__ubuf__ uint8_t*>(wq.GetPhyAddr()), workspace,
+    CombineSenderT<Capacity, Qps, BatchWqes, Direct> sender(td, core, reinterpret_cast<__ubuf__ uint8_t*>(wq.GetPhyAddr()), workspace,
         x, weights, UINT32_MAX, 0, 1, 0, !simt_weights);
     AscendC::GlobalTensor<int32_t> src_gm, rank_gm;
     src_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(src_idx));
@@ -125,20 +127,47 @@ __aicore__ inline void CombineRemoteImpl(
             AscendC::SyncAll<true>();
     }
 }
-template <uint32_t Phase = 0, class Resource>
-__aicore__ inline void CombineRemote(
+template <uint32_t Phase, uint32_t BatchWqes, bool Direct, class Resource>
+__aicore__ inline void CombineRemoteConfigured(
     Resource& r, GM_ADDR x, GM_ADDR weights, GM_ADDR idx, GM_ADDR rp, GM_ADDR cp,
     GM_ADDR workspace, const CombineTilingData& td, uint32_t core)
 {
     if (td.udma_qps_per_worker == 2) {
         if (td.udma_peer_order == kGroupRoundRobinOrder)
-            CombineRemoteImpl<kGroupPeerCapacity, Phase, 2>(r, x, weights, idx, rp, cp, workspace, td, core);
+            CombineRemoteImpl<kGroupPeerCapacity, Phase, 2, Resource, BatchWqes, Direct>(r, x, weights, idx, rp, cp, workspace, td, core);
         else
-            CombineRemoteImpl<kMaxPeers, Phase, 2>(r, x, weights, idx, rp, cp, workspace, td, core);
+            CombineRemoteImpl<kMaxPeers, Phase, 2, Resource, BatchWqes, Direct>(r, x, weights, idx, rp, cp, workspace, td, core);
     } else if (td.udma_peer_order == kGroupRoundRobinOrder)
-        CombineRemoteImpl<kGroupPeerCapacity, Phase, 1>(r, x, weights, idx, rp, cp, workspace, td, core);
+        CombineRemoteImpl<kGroupPeerCapacity, Phase, 1, Resource, BatchWqes, Direct>(r, x, weights, idx, rp, cp, workspace, td, core);
     else
-        CombineRemoteImpl<kMaxPeers, Phase, 1>(r, x, weights, idx, rp, cp, workspace, td, core);
+        CombineRemoteImpl<kMaxPeers, Phase, 1, Resource, BatchWqes, Direct>(r, x, weights, idx, rp, cp, workspace, td, core);
+}
+// Only ordinary peer combine opts into the experimental builder. Pipeline,
+// early-single and token schedules retain their original specialization.
+template <uint32_t Phase = 0, class Resource>
+__aicore__ inline void CombineRemote(
+    Resource& r, GM_ADDR x, GM_ADDR weights, GM_ADDR idx, GM_ADDR rp, GM_ADDR cp,
+    GM_ADDR workspace, const CombineTilingData& td, uint32_t core)
+{
+    if constexpr (Phase == 0) {
+#define COMBINE_BATCH_CASE(N) \
+        case N: \
+            if (td.udma_direct_wqes) \
+                CombineRemoteConfigured<Phase, N, true>(r, x, weights, idx, rp, cp, workspace, td, core); \
+            else \
+                CombineRemoteConfigured<Phase, N, false>(r, x, weights, idx, rp, cp, workspace, td, core); \
+            return;
+        switch (td.udma_batch_wqes) {
+            COMBINE_BATCH_CASE(32)
+            COMBINE_BATCH_CASE(64)
+            COMBINE_BATCH_CASE(128)
+            COMBINE_BATCH_CASE(256)
+        }
+#undef COMBINE_BATCH_CASE
+        trap();
+    } else {
+        CombineRemoteConfigured<Phase, kBatchWqes, false>(r, x, weights, idx, rp, cp, workspace, td, core);
+    }
 }
 #endif
 } // namespace ascend_deepep::udma

@@ -21,6 +21,8 @@ ORDERS = ("rank", "group", "group_staggered", "group_round_robin")
 COMBINE_SELF_COPY_ENV = "DEEPEP_CLOS_COMBINE_PARALLEL_SELF_COPY"
 COMBINE_AFTER_SUBMIT_ENV = "DEEPEP_CLOS_COMBINE_SELF_COPY_AFTER_SUBMIT"
 SELF_COPY_MODES = ("default", "parallel_self_copy", "self_copy_after_submit")
+WQE_BATCH_ENV = "DEEPEP_CLOS_COMBINE_WQE_BATCH"
+WQE_BUILDER_ENV = "DEEPEP_CLOS_COMBINE_WQE_BUILDER"
 SHAPES = ((8192, 2816, 8, 32), (16384, 7168, 6, 64))
 
 
@@ -70,6 +72,15 @@ def combine_candidates(configs, modes, aiv, weighted=False):
         for mode in modes
         if not (weighted and mode == "parallel_self_copy")
         if not (mode == "parallel_self_copy" and "default" in modes and c["payload_aivs"] >= aiv)
+    ]
+
+
+def wqe_candidates(configs, batches, builders):
+    return [
+        c | {"id": f"{c['id']}__{builder}_b{batch}", "wqe_batch": batch, "wqe_builder": builder}
+        for c in configs
+        for builder in builders
+        for batch in batches
     ]
 
 
@@ -137,7 +148,21 @@ def parse_args(argv=None):
     p.add_argument("--replay-report", type=Path, help="rerun each operator's winner from a prior report")
     p.add_argument("--smoke", action="store_true", help="one legal candidate per peer order")
     p.add_argument("--plan-only", action="store_true")
+    p.add_argument("--combine-wqe-batches", type=int, nargs="+", choices=(32, 64, 128, 256))
+    p.add_argument("--combine-wqe-builders", nargs="+", choices=("legacy", "direct"), default=["legacy", "direct"])
+    p.add_argument("--reduce-num-sms", type=int, default=0)
+    p.add_argument("--payload-only-bandwidth", action="store_true", help="exclude FP32 weight bytes")
+    p.add_argument("--max-rank-timing", action="store_true", help="mean of per-sample rank maxima")
     args = p.parse_args(argv)
+    if args.reduce_num_sms < 0 or args.reduce_num_sms > 64 or args.reduce_num_sms % 2:
+        p.error("reduce-num-sms must be 0 or an even count <=64")
+    if args.combine_wqe_batches:
+        if args.replay_report:
+            p.error("WQE sweep uses its saved command, not strategy replay-report")
+        if len(set(args.combine_wqe_batches)) != len(args.combine_wqe_batches):
+            p.error("duplicate WQE batch sizes")
+        if len(set(args.combine_wqe_builders)) != len(args.combine_wqe_builders):
+            p.error("duplicate WQE builders")
     if args.replay_report and args.combine_self_copy_modes and len(args.combine_self_copy_modes) != 1:
         p.error("replay accepts only one explicit self-copy mode")
     args.replay_mode_override = (
@@ -277,6 +302,19 @@ def activate_candidate(torch, buffer, config):
         os.environ[COMBINE_SELF_COPY_ENV] = "1"
     elif mode == "self_copy_after_submit":
         os.environ[COMBINE_AFTER_SUBMIT_ENV] = "1"
+    if "wqe_batch" in config:
+        os.environ[WQE_BATCH_ENV] = str(config["wqe_batch"])
+        os.environ[WQE_BUILDER_ENV] = config["wqe_builder"]
+        from deep_ep import _clos_C
+
+        # Fail before sampling if the installed wheel lacks the new host path.
+        actual = dict(_clos_C._combine_wqe_options())
+        wanted = dict(batch=config["wqe_batch"], builder=config["wqe_builder"], threads=config["wqe_batch"])
+        if actual != wanted:
+            raise RuntimeError(f"native WQE configuration mismatch: {actual} != {wanted}")
+    else:
+        os.environ.pop(WQE_BATCH_ENV, None)
+        os.environ.pop(WQE_BUILDER_ENV, None)
     configure(buffer, config)
 
 
@@ -322,6 +360,8 @@ def parse_capture(directory, op, configs, warmup, samples):
                 notify_us=statistics.mean(values[1]),
                 reduce_us=statistics.mean(values[3]) if len(names) == 4 else 0,
                 communication_samples_us=values[2],
+                notify_samples_us=values[1],
+                reduce_samples_us=values[3] if len(names) == 4 else [0.0] * samples,
             )
         )
     return result
@@ -396,19 +436,43 @@ def measure(torch, torch_npu, buffer, group, args, directory, op, configs, invok
     if any(errors):
         raise RuntimeError(f"profiler parsing failed: {[(i, e) for i, e in enumerate(errors) if e]}")
     gathered = group.gather(
-        dict(bytes=logical_bytes, rows=[{k: r[k] for k in ("mean_us", "notify_us", "reduce_us")} for r in local])
+        dict(
+            bytes=logical_bytes,
+            rows=[
+                {
+                    k: r[k]
+                    for k in (
+                        "mean_us",
+                        "notify_us",
+                        "reduce_us",
+                        "communication_samples_us",
+                        "notify_samples_us",
+                        "reduce_samples_us",
+                    )
+                }
+                for r in local
+            ],
+        )
     )
     result = []
     for index, config in enumerate(configs):
         rows = [r["rows"][index] for r in gathered]
         times = [r["mean_us"] for r in rows]
         bandwidths = [g["bytes"] / r["mean_us"] / 1000 for g, r in zip(gathered, rows)]
+        maxima = {
+            stage: statistics.mean(max(r[f"{stage}_samples_us"][i] for r in rows) for i in range(samples))
+            for stage in ("communication", "notify", "reduce")
+        }
+        max_rank = getattr(args, "max_rank_timing", False)
+        mean_us = maxima["communication"] if max_rank else statistics.mean(times)
+        GBps = statistics.mean(g["bytes"] for g in gathered) / mean_us / 1000
         result.append(
             dict(
                 config=config,
-                GBps=sum(g["bytes"] for g in gathered) / sum(times) / 1000,
+                GBps=GBps,
                 GBps_range=[min(bandwidths), max(bandwidths)],
-                mean_us=statistics.mean(times),
+                mean_us=mean_us,
+                per_sample_max_rank_us=maxima,
                 time_range_us=[min(times), max(times)],
                 notify_us_range=[min(r["notify_us"] for r in rows), max(r["notify_us"] for r in rows)],
                 reduce_us_range=[min(r["reduce_us"] for r in rows), max(r["reduce_us"] for r in rows)],
@@ -480,6 +544,10 @@ def main():
                 for op, r in prior["operations"].items()
             }
             configs = list({c["id"]: c for cs in operations.values() for c in cs}.values())
+        if args.combine_wqe_batches:
+            for op in ("combine_unweighted", "combine_weighted"):
+                if op in operations:
+                    operations[op] = wqe_candidates(operations[op], args.combine_wqe_batches, args.combine_wqe_builders)
         plans.append(dict(shape=shape, configs=configs, operations=operations))
     effective_modes = list(
         dict.fromkeys(c["self_copy_mode"] for p in plans for c in p["operations"]["combine_unweighted"])
@@ -535,6 +603,9 @@ def main():
     ]
     if not list(native.parent.glob(".libs/*.so")):
         identity_paths.append(Path(os.environ["SHMEM_ROOT"]) / "lib/libshmem.so")
+    wrapper = Path(__file__).with_name("bench_wqe_sweep.py")
+    if args.combine_wqe_batches:
+        identity_paths.append(wrapper)
     identity = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in identity_paths}
     group.agree(identity)
     capacity = max(s["tokens"] for s in shapes)
@@ -624,18 +695,23 @@ def main():
                     x, handle=handle, num_sms=a, do_expand=False, async_with_compute_stream=True
                 ),
                 "combine_unweighted": lambda owned=owned, handle=handle, a=a: buffer.combine(
-                    owned, handle, num_sms=a, async_with_compute_stream=True
+                    owned, handle, num_sms=a, reduce_num_sms=args.reduce_num_sms, async_with_compute_stream=True
                 ),
             }
             if weighted:
-                invocations["combine_weighted"] = (
-                    lambda owned=owned, handle=handle, a=a, w=owned_weights: buffer.combine(
-                        owned, handle, topk_weights=w, num_sms=a, async_with_compute_stream=True
+                invocations["combine_weighted"] = lambda owned=owned, handle=handle, a=a, w=owned_weights: (
+                    buffer.combine(
+                        owned,
+                        handle,
+                        topk_weights=w,
+                        num_sms=a,
+                        reduce_num_sms=args.reduce_num_sms,
+                        async_with_compute_stream=True,
                     )
                 )
             item = dict(shape=shape, operations={})
             for op, invoke in invocations.items():
-                row_bytes = h * 2 + (k * 4 if op == "combine_weighted" else 0)
+                row_bytes = h * 2 + (k * 4 if op == "combine_weighted" and not args.payload_only_bandwidth else 0)
                 logical_bytes = (handle.num_recv_tokens if op == "cached_dispatch" else send_rows) * row_bytes
                 op_configs = plan["operations"][op]
                 coarse = measure(
@@ -652,6 +728,15 @@ def main():
                     args.samples,
                 )
                 finalists = [r["config"] for r in coarse[: args.top]]
+                if args.combine_wqe_batches and op != "cached_dispatch":
+                    # Always include matched legacy32 references in both orders.
+                    finalists += [
+                        c
+                        for c in op_configs
+                        if c["wqe_builder"] == "legacy"
+                        and c["wqe_batch"] == 32
+                        and c["id"] not in {f["id"] for f in finalists}
+                    ]
                 rounds = []
                 for turn, order in enumerate((finalists, list(reversed(finalists)))):
                     rounds.append(
@@ -722,7 +807,16 @@ def main():
                 combine_self_copy_modes=effective_modes,
                 pre_combine_notify=True,
                 seed=args.seed,
-                bandwidth_formula="sum(rank deduplicated payload + optional FP32 weight bytes including self) / sum(rank mean communication us) / 1000",
+                bandwidth_formula=(
+                    "mean(rank logical bytes including self) / mean(sample max rank communication us) / 1000"
+                    if args.max_rank_timing
+                    else "sum(rank logical bytes including self) / sum(rank mean communication us) / 1000"
+                ),
+                payload_only_bandwidth=args.payload_only_bandwidth,
+                reduce_num_sms=args.reduce_num_sms,
+                combine_wqe_batches=args.combine_wqe_batches,
+                combine_wqe_builders=args.combine_wqe_builders,
+                command=__import__("sys").argv,
                 identity=identity,
                 buffer_initializations=1,
                 precision_checked=False,

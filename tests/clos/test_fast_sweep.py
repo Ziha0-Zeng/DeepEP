@@ -211,7 +211,8 @@ def test_replay_preserves_old_and_new_modes():
 
 
 @pytest.mark.parametrize("weighted", [False, True])
-def test_full_runner_reuses_one_buffer_across_aiv_and_modes(tmp_path, monkeypatch, weighted):
+@pytest.mark.parametrize("wqe_sweep", [False, True])
+def test_full_runner_reuses_one_buffer_across_aiv_and_modes(tmp_path, monkeypatch, weighted, wqe_sweep):
     """Exercise orchestration without NPU; this is not kernel validation."""
     from types import ModuleType
 
@@ -277,6 +278,13 @@ def test_full_runner_reuses_one_buffer_across_aiv_and_modes(tmp_path, monkeypatc
         monkeypatch.setitem(sys.modules, name, ModuleType(name))
     monkeypatch.setitem(sys.modules, "torch", torch)
     monkeypatch.setitem(sys.modules, "torch.distributed", dist)
+    sys.modules["deep_ep"]._clos_C = SimpleNamespace(
+        _combine_wqe_options=lambda: dict(
+            batch=int(os.environ[sweep.WQE_BATCH_ENV]),
+            builder=os.environ[sweep.WQE_BUILDER_ENV],
+            threads=int(os.environ[sweep.WQE_BATCH_ENV]),
+        )
+    )
     elastic = sys.modules["deep_ep.backends.direct.elastic"]
     elastic.ElasticBuffer = Buffer
     elastic.__file__ = str(tmp_path / "elastic.py")
@@ -298,6 +306,8 @@ def test_full_runner_reuses_one_buffer_across_aiv_and_modes(tmp_path, monkeypatc
         sweep.COMBINE_SELF_COPY_ENV: "0",
         sweep.COMBINE_AFTER_SUBMIT_ENV: "0",
         "DEEPEP_CLOS_TUNING_SESSION": "0",
+        sweep.WQE_BATCH_ENV: "",
+        sweep.WQE_BUILDER_ENV: "",
     }.items():
         monkeypatch.setenv(name, value)
 
@@ -334,12 +344,18 @@ def test_full_runner_reuses_one_buffer_across_aiv_and_modes(tmp_path, monkeypatc
         ]
         + (["--include-weighted-combine"] if weighted else []),
     )
+    if wqe_sweep:
+        sys.argv += ["--combine-wqe-batches", "32", "64", "128", "256"]
     sweep.main()
     assert len(instances) == 1 and instances[0].destroyed
     assert all(b is instances[0] for b, c in configured)
     coarse = [(op, cs) for op, name, cs in measured if name.endswith("_coarse")]
     assert len(coarse) == (6 if weighted else 4)  # dispatch is not repeated per mode
     for op, cs in coarse:
+        if op != "cached_dispatch" and wqe_sweep:
+            assert {(c["wqe_builder"], c["wqe_batch"]) for c in cs} == {
+                (builder, batch) for builder in ("legacy", "direct") for batch in (32, 64, 128, 256)
+            }
         if op == "cached_dispatch":
             assert all("self_copy_mode" not in c for c in cs)
         elif op == "combine_unweighted":

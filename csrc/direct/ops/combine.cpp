@@ -6,6 +6,7 @@
 #include <algorithm>
 
 #include "common/types.h"
+#include "common/combine_wqe_options.h"
 #include "common/platform.h"
 #include "common/udma_schedule.h"
 #include "ops/launcher.h"
@@ -326,6 +327,15 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     tiling.udma_peers_per_worker = static_cast<uint32_t>(udma_peers_per_worker);
     tiling.udma_wqes_per_visit = static_cast<uint32_t>(udma_wqes_per_visit);
     tiling.udma_token_schedule = use_udma && shmem.TokenSchedule();
+    // Read per call so a tuning session can reuse its Buffer and SHMEM queues.
+    const auto wqe_options = ascend_deepep::udma::ReadCombineWqeOptions();
+    if (wqe_options.batch != 32 || wqe_options.direct) {
+        TORCH_CHECK(use_udma && epilogue && !tiling.udma_token_schedule && !aggregate && !pipeline_chunk_tokens &&
+                        !expanded_x.has_value(),
+                    "experimental WQE builder requires ordinary non-expanded UDMA V2 peer combine");
+    }
+    tiling.udma_batch_wqes = wqe_options.batch;
+    tiling.udma_direct_wqes = wqe_options.direct;
     // Serial aggregate materializes every self row; remote single-source rows
     // may still read expanded_x through the sender's existing slot mapping.
     // Early-single and pipeline paths retain their original copy ordering.

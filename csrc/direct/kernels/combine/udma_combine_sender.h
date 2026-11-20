@@ -6,7 +6,7 @@
 #include "utils/debug/asc_assert.h"
 
 namespace ascend_deepep::udma {
-// Combine uses the request area for <=32 spans, each describing one contiguous
+// Combine uses the request area for <=BatchWqes spans, each describing one contiguous
 // run of rows/fields. Index windows remain live until the spans are flushed.
 inline constexpr uint32_t kCombineBasesOffset = kSenderScratchBytes;
 inline constexpr uint32_t kCombineSenderBytes = kCombineBasesOffset + kMaxPeers * sizeof(uint64_t);
@@ -14,7 +14,8 @@ static_assert(kCombineSenderBytes % 32 == 0);
 static_assert(kCombineSenderBytes + kMaxPeers * kTileTokens * sizeof(int32_t) <= platform::kKernelUbBytes);
 
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
-__simt_vf__ __launch_bounds__(32) inline void BuildCombineWqes(
+template <uint32_t BatchWqes, bool Direct>
+__simt_vf__ __launch_bounds__(BatchWqes) inline void BuildCombineWqes(
     __ubuf__ uint64_t* wqes, __ubuf__ uint64_t* spans, __ubuf__ uint64_t* headers, __ubuf__ uint64_t* remote_bases,
     uint64_t x, uint64_t weights, uint64_t x_offset, uint64_t weights_offset, uint32_t x_bytes, uint32_t weight_bytes,
     uint32_t x_stride, uint32_t weight_stride, uint32_t token_capacity, uint32_t fields, uint32_t span_count,
@@ -24,7 +25,19 @@ __simt_vf__ __launch_bounds__(32) inline void BuildCombineWqes(
     const uint32_t i = threadIdx.x;
     if (i >= count)
         return;
-    for (uint32_t s = 0; s < span_count; ++s) {
+    uint32_t first = 0, limit = span_count;
+    if constexpr (Direct) {
+        // Span prefixes are strictly increasing. The usual single-span batch
+        // needs no search; mixed-peer batches retain their original ordering.
+        uint32_t hi = span_count;
+        while (first + 1U < hi) {
+            const uint32_t mid = first + (hi - first) / 2U;
+            if (i < static_cast<uint32_t>(spans[mid * 4U + 3U])) hi = mid;
+            else first = mid;
+        }
+        limit = first + 1U;
+    }
+    for (uint32_t s = first; s < limit; ++s) {
         auto* span = spans + s * 4U;
         const uint32_t begin = static_cast<uint32_t>(span[3]);
         const uint32_t length = static_cast<uint32_t>(span[1] >> 32U);
@@ -69,9 +82,12 @@ __simt_vf__ __launch_bounds__(32) inline void BuildCombineWqes(
     __asc_simt_vf::__trap();
 }
 
-template <uint32_t Capacity = kMaxPeers, uint32_t Qps = 1>
-class CombineSenderT : public SenderT<Capacity, Qps> {
-    using Base = SenderT<Capacity, Qps>;
+template <uint32_t Capacity = kMaxPeers, uint32_t Qps = 1,
+          uint32_t BatchWqes = kBatchWqes, bool Direct = false>
+class CombineSenderT : public SenderT<Capacity, Qps, BatchWqes> {
+    using Base = SenderT<Capacity, Qps, BatchWqes>;
+    static constexpr uint32_t kRequestsOffset = BatchWqes * kWqeBytes;
+    static constexpr uint32_t kHeadersOffset = kRequestsOffset + BatchWqes * 4U * sizeof(uint64_t);
     using Base::scratch_; using Base::count_; using Base::peers_; using Base::qp_;
     using Base::active_state_; using Base::last_;
     static constexpr uint32_t kCombineBasesOffset = kHeadersOffset + Capacity * Qps * 2U * kWqeBytes;
@@ -109,11 +125,11 @@ public:
         if (!rows_pending_) {
             active_state_ = peers_[p].state;
             auto* state = reinterpret_cast<__gm__ aclshmemi_udma_queue_state_t*>(active_state_);
-            aclshmemi_udma_poll_cq_when_sq_overflow(state, peers_[p].slot, qp_, kBatchWqes);
-            if (!aclshmemi_udma_sq_has_credit(state, kBatchWqes))
+            aclshmemi_udma_poll_cq_when_sq_overflow(state, peers_[p].slot, qp_, BatchWqes);
+            if (!aclshmemi_udma_sq_has_credit(state, BatchWqes))
                 trap();
         }
-        const uint32_t n = count < kBatchWqes - rows_pending_ ? count : kBatchWqes - rows_pending_;
+        const uint32_t n = count < BatchWqes - rows_pending_ ? count : BatchWqes - rows_pending_;
         auto* span = reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kRequestsOffset) + spans_ * 4U;
         span[0] = reinterpret_cast<uint64_t>(indices);
         span[1] = uint64_t(row) | (uint64_t(n) << 32U);
@@ -122,7 +138,7 @@ public:
         ++spans_;
         rows_pending_ += n;
         last_ = p;
-        if (rows_pending_ == kBatchWqes)
+        if (rows_pending_ == BatchWqes)
             Flush();
         return n;
     }
@@ -165,8 +181,8 @@ public:
         const uint64_t rank_slot = uint64_t(td_.rank) * td_.token_capacity;
         AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID5);
-        asc_vf_call<BuildCombineWqes>(
-            dim3(32), reinterpret_cast<__ubuf__ uint64_t*>(scratch_),
+        asc_vf_call<BuildCombineWqes<BatchWqes, Direct>>(
+            dim3(BatchWqes), reinterpret_cast<__ubuf__ uint64_t*>(scratch_),
             reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kRequestsOffset),
             reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kHeadersOffset),
             reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kCombineBasesOffset), x_, weights_,

@@ -10,10 +10,19 @@
 #include <torch/extension.h>
 
 #include "common/types.h"
+#include "common/combine_wqe_options.h"
 #include "runtime/shmem_instance.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
+    m.def("_combine_wqe_options", []() {
+        const auto options = ascend_deepep::udma::ReadCombineWqeOptions();
+        pybind11::dict result;
+        result["batch"] = options.batch;
+        result["builder"] = options.direct ? "direct" : "legacy";
+        result["threads"] = options.batch;
+        return result;
+    });
     m.def("get_shmem_unique_id", &GetShmemUniqueId);
     m.def("get_shmem_bootstrap", &GetShmemBootstrap);
     // Keep the Python dtype contract tied to the native V1 dispatch path.

@@ -63,7 +63,8 @@ struct PeerQueue {
 // fields come from its header builder, not duplicated bitfield definitions.
 static_assert(sizeof(aclshmemi_sqe_ctx_t) == 48 && sizeof(aclshmemi_sge_ctx_t) == 16);
 static_assert(ACLSHMEM_UDMA_DATA_MOVER_WQE_SIZE == kWqeBytes);
-__simt_vf__ __launch_bounds__(32) inline void BuildWqes(
+template <uint32_t BatchWqes>
+__simt_vf__ __launch_bounds__(BatchWqes) inline void BuildWqes(
     __ubuf__ uint64_t* wqes, __ubuf__ uint64_t* requests, __ubuf__ uint64_t* headers, uint32_t count)
 {
     const uint32_t i = threadIdx.x;
@@ -84,9 +85,12 @@ __simt_vf__ __launch_bounds__(32) inline void BuildWqes(
 
 // Cache only for this kernel invocation. The SDK still owns admission, SQ
 // wrap, publication, and CQ accounting; every short batch requests one CQE.
-template <uint32_t Capacity = kMaxPeers, uint32_t Qps = 1>
+template <uint32_t Capacity = kMaxPeers, uint32_t Qps = 1, uint32_t BatchWqes = kBatchWqes>
 class SenderT {
     static_assert(Qps == 1 || Qps == 2);
+    static_assert(BatchWqes == 32 || BatchWqes == 64 || BatchWqes == 128 || BatchWqes == 256);
+    static constexpr uint32_t kBatchRequestsOffset = BatchWqes * kWqeBytes;
+    static constexpr uint32_t kBatchHeadersOffset = kBatchRequestsOffset + BatchWqes * 4U * sizeof(uint64_t);
 public:
     __aicore__ SenderT(
         uint32_t rank, uint32_t world, uint32_t owner, uint32_t group, __ubuf__ uint8_t* scratch, GM_ADDR workspace,
@@ -120,7 +124,7 @@ public:
                     trap();
                 auto* memory = aclshmemi_udma_get_mem_info(info, slot, qp);
                 const uint32_t index = lane * Capacity + i;
-                auto* headers = scratch_ + kHeadersOffset + index * 2U * kWqeBytes;
+                auto* headers = scratch_ + kBatchHeadersOffset + index * 2U * kWqeBytes;
                 aclshmemi_udma_fill_sqe_base_ctx<
                     uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, __ubuf__ aclshmemi_sqe_ctx_t*, kData>(
                     reinterpret_cast<__ubuf__ aclshmemi_sqe_ctx_t*>(headers), remote, memory, 0U);
@@ -154,18 +158,18 @@ public:
         if (!pending_) {
             active_state_ = peers_[p].state;
             auto* state = reinterpret_cast<__gm__ aclshmemi_udma_queue_state_t*>(active_state_);
-            aclshmemi_udma_poll_cq_when_sq_overflow(state, peers_[p].slot, qp_, kBatchWqes);
-            if (!aclshmemi_udma_sq_has_credit(state, kBatchWqes))
+            aclshmemi_udma_poll_cq_when_sq_overflow(state, peers_[p].slot, qp_, BatchWqes);
+            if (!aclshmemi_udma_sq_has_credit(state, BatchWqes))
                 trap();
         }
-        auto* request = reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kRequestsOffset) + pending_ * 4U;
+        auto* request = reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kBatchRequestsOffset) + pending_ * 4U;
         request[0] = peers_[p].remote_base + (reinterpret_cast<uint64_t>(dst) - local_base_);
         request[1] = reinterpret_cast<uint64_t>(src);
         request[2] = bytes;
         request[3] = p;
         last_ = p;
         ++pending_;
-        if (pending_ == kBatchWqes)
+        if (pending_ == BatchWqes)
             Flush();
     }
     __aicore__ void Flush()
@@ -174,10 +178,10 @@ public:
             return;
         AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID5);
-        asc_vf_call<BuildWqes>(
-            dim3(32), reinterpret_cast<__ubuf__ uint64_t*>(scratch_),
-            reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kRequestsOffset),
-            reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kHeadersOffset), pending_);
+        asc_vf_call<BuildWqes<BatchWqes>>(
+            dim3(BatchWqes), reinterpret_cast<__ubuf__ uint64_t*>(scratch_),
+            reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kBatchRequestsOffset),
+            reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kBatchHeadersOffset), pending_);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
         aclshmemi_udma_flush_aggregate_wqes(
