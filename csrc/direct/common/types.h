@@ -142,6 +142,7 @@ struct alignas(8) CombineTilingData {
     uint32_t udma_qps_per_worker = 1;
     uint32_t udma_self_copy_first_aiv = 0;
     uint32_t udma_self_copy_after_submit = 0;
+    uint32_t compact_self_rows = 0;  // Applies to both communication and reduction.
     uint32_t udma_weight_mode = 0;  // 0 legacy, 1 UDMA, 2 SIMT if spare AIVs exist.
     uint32_t udma_batch_wqes = 32;
     uint32_t udma_direct_wqes = 0;

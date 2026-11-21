@@ -244,9 +244,16 @@ class UdmaPolicy:
             if self.world_size == 32 and operation == "dispatch" and cores >= 32:
                 profile_cores = 32
             entry = _PROFILES.get((self.world_size, profile_cores, bucket, operation))
+            ep8_plan = (
+                _EP8_COMPACT_PLANS.get((row_bytes, operation))
+                if self.world_size == 8 and cores == 8 else None
+            )
+            if ep8_plan is not None:
+                order, peers = ep8_plan
+                entry = ((8,), order, peers, 1, 1, 32, 0 if operation == "dispatch" else 2)
             if (
                 entry is not None
-                and 2048 <= row_bytes <= 12288
+                and (2048 <= row_bytes <= 12288 or ep8_plan is not None)
                 and self.topology_known
                 and self.ranks_per_group in entry[0]
             ):
@@ -421,6 +428,20 @@ def _contiguous_group_size(hosts):
         return 0
     return blocks[0][1]
 
+
+# Single-host EP8, eight communication AIVs, BF16, non-expanded.
+# The key is the payload width in bytes; values are peer order and peers per worker.
+_EP8_COMPACT_PLANS = {
+    (5632, "dispatch"): (0, 2),
+    (5632, "combine"): (0, 1),
+    (5632, "weighted"): (0, 2),
+    (12288, "dispatch"): (3, 2),
+    (12288, "combine"): (0, 1),
+    (12288, "weighted"): (0, 1),
+    (14336, "dispatch"): (3, 2),
+    (14336, "combine"): (0, 1),
+    (14336, "weighted"): (0, 1),
+}
 
 # In-sample conservative fits: BF16, non-expanded, EP4/8/16/32,
 # 2 KiB / 5.5 KiB / 12 KiB rows, random routing. Group sizes are

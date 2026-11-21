@@ -18,6 +18,11 @@ __aicore__ inline uint32_t CombineWeightFirst(const CombineTilingData& td)
 
 __aicore__ inline bool CombineSimtWeightsEnabled(const CombineTilingData& td)
 {
+    // With four or fewer auxiliary AIVs, wide EP8 payloads leave enough time
+    // on the send queue to carry the small weight row with each feature row.
+    // Preserve explicit per-launch weight choices.
+    if (td.compact_self_rows && td.udma_weight_mode == 0 && td.hidden * td.x_element_bytes >= 12288U)
+        return false;
     return ASCEND_DEEPEP_COMBINE_SIMT_WEIGHTS && td.udma_weight_mode != 1 && td.has_topk_weights && td.num_topk &&
            !td.udma_token_schedule && CombineWeightFirst(td) < td.block_dim;
 }

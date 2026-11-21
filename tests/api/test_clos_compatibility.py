@@ -538,7 +538,9 @@ def test_launch_profiles_are_immutable_cached_and_topology_scoped():
                 base = replace(resolve_udma_policy(True, ep, 'udma', None, None, None, None, None),
                                ranks_per_group=group, topology_known=True)
                 before = base.signature()
-                args = (cores, 2048 if bucket == 'small' else 5632, op)
+                # Exercise the generic bucket outside EP8's exact-width overrides.
+                width = 5600 if (ep, cores, bucket) == (8, 8, 'large') else 5632
+                args = (cores, 2048 if bucket == 'small' else width, op)
                 plan = base.for_launch(*args, bf16=True)
                 assert plan is base.for_launch(*args, bf16=True)
                 assert plan.native_plan()[:7] == [1, order, group, p, w, q, visit]
@@ -557,6 +559,25 @@ def test_launch_profiles_are_immutable_cached_and_topology_scoped():
         for known, group in ((True,16), (False,8)):
             policy = replace(base, ranks_per_group=group, topology_known=known)
             assert policy.for_launch(32,5632,'combine',bf16=True).peer_order == 0
+    """)
+
+
+def test_ep8_compact_return_plans_use_eight_communication_aivs():
+    run_host("""
+        from dataclasses import replace
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
+        base = replace(resolve_udma_policy(True,8,'udma',None,None,None,None,None),
+                       ranks_per_group=8,topology_known=True)
+        for size in (5632,12288,14336):
+            dispatch, combine, weighted = [base.for_launch(8,size,op,bf16=True)
+                                           for op in ('dispatch','combine','weighted')]
+            assert dispatch.peer_order == (0 if size == 5632 else 3) and dispatch.peers_per_worker == 2
+            assert combine.peer_order == 0 and combine.peers_per_worker == 1
+            assert (weighted.peers_per_worker,weighted.weight_mode) == ((2,2) if size == 5632 else (1,1))
+            assert max(p.send_workers for p in (dispatch,combine,weighted)) <= 8
+        # A multi-host EP8 retains the generic plan.
+        other = replace(base,ranks_per_group=2)
+        assert other.for_launch(8,5632,'dispatch',bf16=True).peer_order == 0
     """)
 
 
@@ -704,7 +725,8 @@ def test_core_tiers_preserve_actual_budgets_and_capacity():
                 base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
                                ranks_per_group=group, topology_known=True)
                 for cores in (range(8,16,2) if tier == 8 else range(32,64,2)):
-                    plan = base.for_launch(cores,2048 if bucket == 'small' else 5632,op,bf16=True)
+                    width = 5600 if (ep, cores, bucket) == (8, 8, 'large') else 5632
+                    plan = base.for_launch(cores,2048 if bucket == 'small' else width,op,bf16=True)
                     assert plan.native_plan()[:7] == [1,order,group,p,w,q,visit]
                     assert base.config(cores).num_aiv == cores
                     if op == 'combine':
@@ -968,9 +990,10 @@ def test_benchmark_reports_separate_launch_plans():
             udma_peers_per_group_per_worker=None,udma_workers_per_peer=2,udma_qps_per_worker=1)
         result = effective_udma_config(b,num_aiv=8,row_bytes=5632,bf16=True)
         plans = result['operation_plans']
-        assert plans['dispatch']['qps_per_worker'] == 2
-        assert plans['weighted']['qps_per_worker'] == 1
-        assert plans['weighted']['weight_mode'] == 1
+        assert plans['dispatch']['peer_order'] == 0
+        assert plans['dispatch']['peers_per_worker'] == 2
+        assert plans['weighted']['peers_per_worker'] == 2
+        assert plans['weighted']['weight_mode'] == 2
         assert plans['combine']['self_copy'] == 2
         for early, chunk in ((False,0),(True,0),(False,32)):
             b._use_early_single_source_combine = early
