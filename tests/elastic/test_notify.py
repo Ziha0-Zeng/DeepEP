@@ -2197,6 +2197,7 @@ int main()
         "-I" + str(root / "tests/runtime"),
         "-I" + str(root / "csrc"),
         str(root / "csrc/runtime/session.cpp"),
+        str(root / "csrc/runtime/instances.cpp"),
         str(source),
         "-ldl",
         "-o",

@@ -57,8 +57,11 @@ done
 
 ## CPU 回归
 
+没有 Torch 的 CPU 环境先安装 CPU 版 PyTorch。已有匹配的 Torch/torch_npu 环境可以沿用现有版本。
+
 ```bash
 python -m pip install -r requirements-dev.txt
+python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.12.0'
 python -m pytest -m "not framework" -q
 ```
 

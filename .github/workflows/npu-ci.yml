@@ -1,0 +1,135 @@
+name: DeepEP A5 HT CI
+run-name: 'A5 HT PR #${{ inputs.pr_number }} (${{ inputs.ci_mode }})'
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number
+        required: true
+      ci_mode:
+        description: Correctness matrix (both modes satisfy the HT gate)
+        type: choice
+        options: [quick, full]
+        default: quick
+      requested_by:
+        description: Original admin for comment dispatch
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deepep-a5-pr-${{ inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    outputs:
+      head_sha: ${{ steps.prepare.outputs.head_sha }}
+      head_repo: ${{ steps.prepare.outputs.head_repo }}
+      base_sha: ${{ steps.prepare.outputs.base_sha }}
+      base_ref: ${{ steps.prepare.outputs.base_ref }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/github-script@v8
+        id: prepare
+        env:
+          CI_PR: ${{ inputs.pr_number }}
+          CI_MODE: ${{ inputs.ci_mode }}
+          CI_REQUESTED_BY: ${{ inputs.requested_by }}
+          CI_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          CI_TRUSTED_SHA: ${{ github.workflow_sha }}
+        with:
+          script: |
+            await require('./ci/github.cjs').prepare({ github, context, core, env: process.env });
+
+  a5:
+    needs: prepare
+    runs-on: [self-hosted, linux, ascend950, deepep-ci]
+    timeout-minutes: 300
+    permissions:
+      contents: read
+    steps:
+      - name: Check out trusted CI
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted-ci
+          persist-credentials: false
+      - name: Check out exact PR revision
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ needs.prepare.outputs.head_repo }}
+          ref: ${{ needs.prepare.outputs.head_sha }}
+          fetch-depth: 0
+          path: source
+          persist-credentials: false
+      - name: Build, install and run HT tests
+        env:
+          CI_HEAD_SHA: ${{ needs.prepare.outputs.head_sha }}
+          CI_BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+          CI_TRUSTED_SHA: ${{ github.workflow_sha }}
+          CI_MODE: ${{ inputs.ci_mode }}
+          CI_PR: ${{ inputs.pr_number }}
+        run: bash trusted-ci/ci/run_a5.sh "$GITHUB_WORKSPACE/source" "$RUNNER_TEMP/deepep-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+      - name: Preserve reports and logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: a5-ht-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/deepep-${{ github.run_id }}-${{ github.run_attempt }}/result.json
+            ${{ runner.temp }}/deepep-${{ github.run_id }}-${{ github.run_attempt }}/*.log
+            ${{ runner.temp }}/deepep-${{ github.run_id }}-${{ github.run_attempt }}/package/validation.json
+            ${{ runner.temp }}/deepep-${{ github.run_id }}-${{ github.run_attempt }}/package/*tests.xml
+            ${{ runner.temp }}/deepep-${{ github.run_id }}-${{ github.run_attempt }}/package/dist/*
+            ${{ runner.temp }}/deepep-${{ github.run_id }}-${{ github.run_attempt }}/ht/**/*.json
+          if-no-files-found: error
+          retention-days: 7
+
+  finalize:
+    needs: [prepare, a5]
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+      statuses: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v6
+        id: reports
+        continue-on-error: true
+        with:
+          name: a5-ht-${{ github.run_id }}-${{ github.run_attempt }}
+          path: reports
+      - name: Validate and publish gate
+        if: always()
+        uses: actions/github-script@v8
+        env:
+          CI_HEAD_SHA: ${{ needs.prepare.outputs.head_sha }}
+          CI_BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+          CI_TRUSTED_SHA: ${{ github.workflow_sha }}
+          CI_PR: ${{ inputs.pr_number }}
+          CI_MODE: ${{ inputs.ci_mode }}
+          CI_BASE_REF: ${{ needs.prepare.outputs.base_ref }}
+          CI_A5_RESULT: ${{ needs.a5.result }}
+          CI_DOWNLOAD_RESULT: ${{ steps.reports.outcome }}
+        with:
+          script: |
+            await require('./ci/github.cjs').finalize({ github, context, core, env: process.env });

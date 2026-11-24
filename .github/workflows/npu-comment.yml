@@ -1,0 +1,41 @@
+name: DeepEP NPU comment dispatcher
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+
+jobs:
+  dispatch:
+    if: github.event.issue.pull_request
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/github-script@v8
+        with:
+          script: |
+            const match = context.payload.comment.body.trim().match(/^\/run-npu-ci(?:\s+(quick|full))?$/);
+            if (!match) return;
+            const { data: permission } = await github.rest.repos.getCollaboratorPermissionLevel({
+              ...context.repo, username: context.actor,
+            });
+            if (permission.permission !== 'admin') {
+              core.setFailed('Only repository admins may start self-hosted NPU jobs.');
+              return;
+            }
+            const { data: repo } = await github.rest.repos.get(context.repo);
+            const { data: pr } = await github.rest.pulls.get({
+              ...context.repo, pull_number: context.issue.number,
+            });
+            if (pr.state !== 'open' || pr.draft || !pr.head.repo || pr.base.ref !== repo.default_branch) {
+              core.setFailed('Expected an open, ready PR targeting the default branch.');
+              return;
+            }
+            await github.rest.actions.createWorkflowDispatch({
+              ...context.repo, workflow_id: 'npu-ci.yml', ref: repo.default_branch,
+              inputs: { pr_number: String(context.issue.number), ci_mode: match[1] || 'quick', requested_by: context.actor },
+            });

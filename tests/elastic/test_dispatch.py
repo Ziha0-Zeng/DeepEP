@@ -676,8 +676,8 @@ def _host_elastic_buffer(monkeypatch):
         ),
         combine_ep8_mte_version=lambda: 2,
     )
+    monkeypatch.setattr(elastic, "require_native", lambda _: native)
     for module in (elastic, event):
-        monkeypatch.setattr(module, "require_native", lambda _: native)
         monkeypatch.setattr(module, "npu_api", lambda: npu)
     buffer = elastic.ElasticBuffer.__new__(elastic.ElasticBuffer)
     buffer.hidden = 0
@@ -1171,6 +1171,7 @@ def test_dispatch_control_reuse_host_waits(tmp_path):
 using ascend_deepep::DispatchTiling;
 std::string calls;
 bool fail_clear = false;
+constexpr uint32_t kTestInstanceId = 7;
 struct Session {
 """
         + controls
@@ -1181,6 +1182,10 @@ bool dispatch_controls_valid_ = false;
 uint64_t capacity() const
 {
     return 1ULL << 32;
+}
+uint32_t instance_id() const
+{
+    return kTestInstanceId;
 }
 void barrier()
 {
@@ -1199,9 +1204,9 @@ int aclrtMemsetAsync(void*, size_t bytes, int value, size_t count, void*)
     calls += 'Z';
     return fail_clear ? -1 : 0;
 }
-void notify_dispatch_barrier_kernel_do(void*, unsigned cores)
+void notify_dispatch_barrier_kernel_do(void*, unsigned cores, uint32_t instance_id)
 {
-    assert(cores == 64);
+    assert(cores == 64 && instance_id == kTestInstanceId);
     calls += 'B';
 }
 void dispatch_kernel_do(void*, uint8_t*, uint8_t*, uint8_t*, uint8_t*, uint8_t*, uint8_t*, uint8_t*)

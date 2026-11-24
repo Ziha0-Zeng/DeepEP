@@ -1,0 +1,25 @@
+name: DeepEP NPU pending
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  pending:
+    if: github.event.pull_request.base.ref == github.event.repository.default_branch && !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      # Load only the base branch workflow revision in this privileged job.
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/github-script@v8
+        with:
+          script: |
+            await require('./ci/github.cjs').markPending({ github, context });

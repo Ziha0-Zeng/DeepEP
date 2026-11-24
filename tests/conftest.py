@@ -6,6 +6,12 @@
 import os
 import pytest
 
+# These files are standalone NPU launchers with no pytest cases.
+collect_ignore = [
+    "clos/source/test_multi_buffer.py",
+    "clos/source/test_v1_v2_shared_backend.py",
+]
+
 
 @pytest.fixture
 def shmem_wheel_payload():

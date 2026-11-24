@@ -22,7 +22,7 @@ MegaMoE 和 EpGmmFused 通过独立开关选择构建，见下文实验组件说
   `lib/libshmem.so` 以及 `src/device`、`src/device_simt` 等 Device 头文件。
 - 普通（HT）dispatch/combine 依赖 SHMEM 的 shared-jetty 支持，包括 Host 配置接口和 Device 共享队列状态；使用锁文件固定的 `cann/shmem` dev 提交，不直接跟随分支最新版本。
 - CANN 安装中须包含 `tools/bisheng_compiler/bin/bisheng`，Device 使用 `-xasc` 编译。
-- 普通 CPU 测试仅需 `requirements-dev.txt`；wheel 构建依赖固定在 `pyproject.toml`。
+- CPU 测试使用 `requirements-dev.txt` 和 PyTorch，安装命令见[测试说明](../tests/README.md#cpu-回归)。wheel 构建依赖固定在 `pyproject.toml`。
 - wheel 构建不自动下载/编译外部 SDK。构建时将所选 SHMEM SDK 的运行库打入 wheel；驱动和 CANN 仍由部署环境提供。
 
 ## 可选实验组件
@@ -183,6 +183,6 @@ python scripts/validate_package.py --output /path/to/another-new-directory \
 
 ## CI 与产物
 
-当前仓库未配置自动 CI 流水线。请手动运行 pre-commit，并按变更范围运行 CPU API、参考、运行时和构建预检。CPU fault-injection 使用 Linux/g++，不等于 CANN ABI 或 NPU 测试。检查命令见[开发指南](development.md#提交前检查与-ci)。
+提交前运行 pre-commit，并按变更范围运行 CPU API、参考、运行时和构建预检。CPU 故障注入需要 Linux/g++，设备验证使用 A5 runner。检查命令见[开发指南](development.md#提交前检查与-ci)，部署方式见 [CI 部署与门禁](ci.md)。
 
 在具备 CANN、SHMEM、框架与已分配 NPU 的环境执行本页验证命令。保留 `source-tests.xml`、`installed-tests.xml`、`validation.json` 和逐 rank 输出，wheel/sdist 作为独立产物归档。安装成功、CPU 通过和设备算子通过分别记录，不互相替代。

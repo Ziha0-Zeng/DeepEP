@@ -2741,9 +2741,14 @@ void asc_stcg(T* p, T v)
     *p = v;
 }
 namespace simt {
+constexpr uint32_t kTestInstanceId = 7;
 std::vector<std::vector<float>> receive;
 std::vector<std::vector<uint64_t>> done;
 std::vector<std::vector<uint32_t>> writes;
+void aclshmemx_instance_ctx_set(uint32_t instance_id)
+{
+    assert(instance_id == kTestInstanceId);
+}
 void aclshmem_float_p(float* address, float value, int32_t peer)
 {
     const auto index = address - receive[0].data();
@@ -2776,6 +2781,7 @@ int main()
     cross_ranges_test::run();
     dispatch_credit_test::run();
     static_assert(ascend_deepep::kMaxDispatchRanks >= 512);
+    static_assert(sizeof(CombineTiling) == 168);
     for (uint32_t world : {2U, 8U, 16U, 32U, 64U, 128U, 256U, 512U}) {
         const uint32_t width = first_hit_schedule::Width(world);
         for (uint32_t rank = 0; rank < world; ++rank) {
@@ -2808,12 +2814,12 @@ int main()
         for (uint32_t reducer = 0; reducer < reducers; ++reducer) {
             for (threadIdx.x = 0; threadIdx.x < 128; ++threadIdx.x) {
                 ScatterWeights(weights.data(), ids.data(), simt::receive[0].data(), ids.size() * reducer / reducers,
-                               ids.size() * (reducer + 1) / reducers, values);
-                ScatterWeights(nullptr, nullptr, simt::receive[0].data(), 0, 0, values);
+                               ids.size() * (reducer + 1) / reducers, values, simt::kTestInstanceId);
+                ScatterWeights(nullptr, nullptr, simt::receive[0].data(), 0, 0, values, simt::kTestInstanceId);
             }
         }
         for (threadIdx.x = 0; threadIdx.x < 64; ++threadIdx.x) {
-            NotifyWeightRanks(simt::done[0].data() + (world - 1) * 64, world);
+            NotifyWeightRanks(simt::done[0].data() + (world - 1) * 64, world, simt::kTestInstanceId);
         }
         for (uint32_t peer = 0; peer < world; ++peer) {
             assert(simt::done[peer][(world - 1) * 64] == 1);
@@ -2857,7 +2863,7 @@ int main()
                 assert(SoWindowEnd(t, 11) == 14U);
                 assert(SoWindowEnd(t, 15) == 18U);
             }
-            assert(sizeof(t) == 160);
+            assert(t.instance_id == 0);
             assert(t.weight_topk == 2 && !t.with_weights && t.weight_rows == 0);
             assert(t.weight_recv_offset_bytes % 512 == 0);
             assert(t.weight_local_done_offset_bytes >= t.weight_recv_offset_bytes + uint64_t(tokens) * 2 * 4);
@@ -2948,7 +2954,9 @@ int main()
                 assert error.code == 0
         stdout = output.read_text(encoding="utf-8")
     else:
-        stdout = subprocess.run([str(executable)], check=True, capture_output=True, text=True, timeout=30).stdout
+        result = subprocess.run([str(executable)], capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result.stderr
+        stdout = result.stdout
     from deep_ep.buffers._elastic_layout import combine_layout, dispatch_layout, workspace_layout
 
     for line in stdout.splitlines():

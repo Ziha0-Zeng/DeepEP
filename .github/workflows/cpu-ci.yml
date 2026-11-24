@@ -1,0 +1,53 @@
+name: DeepEP CPU CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cpu-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: DeepEP / Lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -r requirements-dev.txt
+      - run: pre-commit run --all-files --show-diff-on-failure
+
+  host:
+    name: DeepEP / CPU
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Prepare host tools
+        run: |
+          command -v g++
+          python -m pip install -r requirements-dev.txt
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.12.0'
+      - run: python -m pytest -m "not framework" -q --junitxml=cpu-tests.xml
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: cpu-tests-${{ github.run_id }}-${{ github.run_attempt }}
+          path: cpu-tests.xml
+          if-no-files-found: error
